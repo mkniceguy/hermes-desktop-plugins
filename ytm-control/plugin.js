@@ -455,12 +455,14 @@ function RatePill({ token, video, queryClient }) {
 }
 
 function VolumeBar({ token, volume, queryClient }) {
+  const [dragging, setDragging] = useState(false)
   const [local, setLocal] = useState(volume ?? 50)
-  useEffect(() => { setLocal(volume ?? 50) }, [volume])
-  const setVol = (v) => {
-    setLocal(v)
-    cmd(token, 'setVolume', v).then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
+  useEffect(() => { if (!dragging) setLocal(volume ?? 50) }, [volume, dragging])
+
+  const commit = (v) => {
+    cmd(token, 'setVolume', v).catch(() => {}).then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
   }
+
   return jsxs('div', {
     className: 'flex items-center gap-2 px-3 py-1 text-xs',
     children: [
@@ -469,15 +471,18 @@ function VolumeBar({ token, volume, queryClient }) {
         type: 'range',
         min: 0,
         max: 100,
-        value: local,
+        value: dragging ? local : (volume ?? 50),
         'aria-label': 'Volume',
-        onChange: (e) => setVol(Number(e.target.value)),
+        onPointerDown: () => setDragging(true),
+        onPointerUp: () => { setDragging(false); commit(local) },
+        onTouchEnd: () => { setDragging(false); commit(local) },
+        onChange: (e) => { setDragging(true); setLocal(Number(e.target.value)) },
         style: { flex: 1, accentColor: 'var(--ui-accent)', height: '3px' },
       }),
       jsx('span', {
         className: 'text-(--ui-text-quaternary)',
         style: { width: '20px', textAlign: 'right' },
-        children: String(volume ?? 0),
+        children: String(dragging ? local : (volume ?? 0)),
       }),
     ],
   })
@@ -499,11 +504,12 @@ function YtmPane() {
     queryFn: () => getState(auth.token),
     enabled: auth.connected && !!auth.token,
     refetchInterval: POLL_MS,
-    retry: 1,
+    retry: 3,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 4000),
     staleTime: Math.floor(POLL_MS / 2),
   })
 
-  const offline = !!stateError
+  const offline = !!stateError && !state
   const player = state?.player
   const video = state?.video
 
@@ -604,7 +610,8 @@ function StatusChip() {
     queryFn: () => getState(token),
     enabled: !!token,
     refetchInterval: POLL_MS,
-    retry: false,
+    retry: 2,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 4000),
     staleTime: Math.floor(POLL_MS / 2),
   })
   if (!token) return null
