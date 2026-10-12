@@ -361,7 +361,9 @@ function SeekBar({ token, progress, duration, queryClient }) {
   }, [progress, dragging])
 
   const commit = (sec) => {
-    cmd(token, 'seekTo', sec).then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
+    cmd(token, 'seekTo', sec).catch(() => {}).then(() => {
+      queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }).then(() => setDragging(false))
+    })
   }
 
   return jsxs('div', {
@@ -376,10 +378,10 @@ function SeekBar({ token, progress, duration, queryClient }) {
         disabled: !duration,
         'aria-label': 'Seek position',
         onPointerDown: () => setDragging(true),
-        onPointerUp: () => { setDragging(false); commit(local) },
-        onTouchEnd: () => { setDragging(false); commit(local) },
+        onPointerUp: () => commit(local),
+        onTouchEnd: () => commit(local),
         onChange: (e) => setLocal(Number(e.target.value)),
-        onKeyDown: (e) => { if (e.key === 'Enter') { setDragging(false); commit(local) } },
+        onKeyDown: (e) => { if (e.key === 'Enter') commit(local) },
         style: { flex: 1, accentColor: 'var(--ui-accent)', height: '3px', cursor: duration ? 'pointer' : 'default' },
       }),
       jsx('span', { children: fmtTime(duration) }),
@@ -460,24 +462,29 @@ function VolumeBar({ token, volume, queryClient }) {
   useEffect(() => { if (!dragging) setLocal(volume ?? 50) }, [volume, dragging])
 
   const commit = (v) => {
-    cmd(token, 'setVolume', v).catch(() => {}).then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
+    cmd(token, 'setVolume', v).catch(() => {}).then(() => {
+      queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }).then(() => setDragging(false))
+    })
   }
 
   return jsxs('div', {
     className: 'flex items-center gap-2 px-3 py-1 text-xs',
     children: [
       IconBtn({ icon: I.volume, onClick: () => cmd(token, 'mute').then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] })), size: 14, pad: 2, label: 'Mute' }),
-      jsx('input', {
-        type: 'range',
-        min: 0,
-        max: 100,
-        value: dragging ? local : (volume ?? 50),
-        'aria-label': 'Volume',
-        onPointerDown: () => setDragging(true),
-        onPointerUp: () => { setDragging(false); commit(local) },
-        onTouchEnd: () => { setDragging(false); commit(local) },
-        onChange: (e) => { setDragging(true); setLocal(Number(e.target.value)) },
-        style: { flex: 1, accentColor: 'var(--ui-accent)', height: '3px' },
+      jsx('div', {
+        style: { width: '24px', height: '90px', position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
+        children: jsx('input', {
+          type: 'range',
+          min: 0,
+          max: 100,
+          value: dragging ? local : (volume ?? 50),
+          'aria-label': 'Volume',
+          onPointerDown: () => setDragging(true),
+          onPointerUp: () => commit(local),
+          onTouchEnd: () => commit(local),
+          onChange: (e) => { setDragging(true); setLocal(Number(e.target.value)) },
+          style: { transform: 'rotate(-90deg)', transformOrigin: 'center center', width: '90px', height: '24px', accentColor: 'var(--ui-accent)', cursor: 'pointer' },
+        }),
       }),
       jsx('span', {
         className: 'text-(--ui-text-quaternary)',
@@ -655,7 +662,7 @@ function StatusChip() {
 export default {
   id: 'ytm-control',
   name: 'YouTube Music Control',
-  version: '0.2.0',
+  version: '0.2.2',
   register(ctx) {
     storage = ctx.storage
     ctx.registerMany([
