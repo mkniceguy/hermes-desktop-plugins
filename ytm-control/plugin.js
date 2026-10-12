@@ -471,20 +471,17 @@ function VolumeBar({ token, volume, queryClient }) {
     className: 'flex items-center gap-2 px-3 py-1 text-xs',
     children: [
       IconBtn({ icon: I.volume, onClick: () => cmd(token, 'mute').then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] })), size: 14, pad: 2, label: 'Mute' }),
-      jsx('div', {
-        style: { width: '24px', height: '90px', position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-        children: jsx('input', {
-          type: 'range',
-          min: 0,
-          max: 100,
-          value: dragging ? local : (volume ?? 50),
-          'aria-label': 'Volume',
-          onPointerDown: () => setDragging(true),
-          onPointerUp: () => commit(local),
-          onTouchEnd: () => commit(local),
-          onChange: (e) => { setDragging(true); setLocal(Number(e.target.value)) },
-          style: { transform: 'rotate(-90deg)', transformOrigin: 'center center', width: '90px', height: '24px', accentColor: 'var(--ui-accent)', cursor: 'pointer' },
-        }),
+      jsx('input', {
+        type: 'range',
+        min: 0,
+        max: 100,
+        value: dragging ? local : (volume ?? 50),
+        'aria-label': 'Volume',
+        onPointerDown: () => setDragging(true),
+        onPointerUp: () => commit(local),
+        onTouchEnd: () => commit(local),
+        onChange: (e) => { setDragging(true); setLocal(Number(e.target.value)) },
+        style: { flex: 1, accentColor: 'var(--ui-accent)', height: '3px', cursor: 'pointer' },
       }),
       jsx('span', {
         className: 'text-(--ui-text-quaternary)',
@@ -662,7 +659,7 @@ function StatusChip() {
 export default {
   id: 'ytm-control',
   name: 'YouTube Music Control',
-  version: '0.2.2',
+  version: '0.2.3',
   register(ctx) {
     storage = ctx.storage
     ctx.registerMany([
