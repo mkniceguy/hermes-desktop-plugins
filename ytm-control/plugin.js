@@ -97,6 +97,25 @@ async function cmd(token, command, data) {
   if (!res.ok) throw new Error(`Command failed: ${res.status}`)
 }
 
+function isPrivateBaseUrl(url) {
+  try {
+    const u = new URL(url)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
+    const h = u.hostname.toLowerCase()
+    if (h === 'localhost') return true
+    if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return false
+    const parts = h.split('.').map(Number)
+    if (parts.some((p) => p < 0 || p > 255)) return false
+    if (parts[0] === 10) return true
+    if (parts[0] === 127) return true
+    if (parts[0] === 192 && parts[1] === 168) return true
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true
+    return false
+  } catch (e) {
+    return false
+  }
+}
+
 async function testConnection(url) {
   const base = url.replace(/\/+$/, '')
   const res = await fetch(`${base}/api/v1/state`, { headers: hdr() })
@@ -129,6 +148,8 @@ const I = {
   thumbDown: 'M17 2v11h5V2h-5zm-2 0H6c-.83 0-1.54.5-1.84 1.22L1.14 10.27c-.09.23-.14.47-.14.73v2c0 1.1.9 2 2 2h6.31l-.95 4.57-.03.32c0 .41.17.79.44 1.06L9.83 22l6.59-6.59c.36-.36.58-.86.58-1.41V4c0-1.1-.9-2-2-2z',
   volume: 'M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z',
   settings: 'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm8.94 3.06a1.5 1.5 0 0 0-.64-2.5l-1.1-.22a7.97 7.97 0 0 0-.56-1.36l.63-.94a1.5 1.5 0 0 0-.19-1.9l-.85-.85a1.5 1.5 0 0 0-1.9-.19l-.94.63c-.44-.22-.9-.4-1.36-.56l-.22-1.1a1.5 1.5 0 0 0-2.5-.64h-1.2a1.5 1.5 0 0 0-2.5.64l-.22 1.1c-.46.16-.92.34-1.36.56l-.94-.63a1.5 1.5 0 0 0-1.9.19l-.85.85a1.5 1.5 0 0 0-.19 1.9l.63.94c-.22.44-.4.9-.56 1.36l-1.1.22a1.5 1.5 0 0 0-.64 2.5v1.2a1.5 1.5 0 0 0 .64 2.5l1.1.22c.16.46.34.92.56 1.36l-.63.94a1.5 1.5 0 0 0 .19 1.9l.85.85a1.5 1.5 0 0 0 1.9.19l.94-.63c.44.22.9.4 1.36.56l.22 1.1a1.5 1.5 0 0 0 2.5.64h1.2a1.5 1.5 0 0 0 2.5-.64l.22-1.1c.46-.16.92-.34 1.36-.56l.94.63a1.5 1.5 0 0 0 1.9-.19l.85-.85a1.5 1.5 0 0 0 .19-1.9l-.63-.94c.22-.44.4-.9.56-1.36l1.1-.22a1.5 1.5 0 0 0 .64-2.5v-1.2z',
+  repeat: 'M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z',
+  shuffle: 'M16 3h5v5M4 20L21 3M21 16v5h-5M4 4l5 5',
 }
 
 function fmtTime(s) {
@@ -412,6 +433,45 @@ function Transport({ token, player, queryClient }) {
   })
 }
 
+// Extra controls: repeat cycle + shuffle
+function ExtraControls({ token, state, queryClient }) {
+  const repeatMode = state?.player?.queue?.repeatMode ?? 0
+  const [shuffled, setShuffled] = useState(false)
+  const run = (command, data) => {
+    cmd(token, command, data).catch(() => {}).then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
+  }
+  const cycleRepeat = () => {
+    const next = repeatMode >= 2 ? 0 : repeatMode + 1
+    run('repeatMode', next)
+  }
+  const doShuffle = () => {
+    setShuffled((v) => !v)
+    run('shuffle')
+  }
+  const repeatLabel = repeatMode === 2 ? 'Repeat: one' : repeatMode === 1 ? 'Repeat: all' : 'Repeat: off'
+  return jsxs('div', {
+    className: 'flex items-center justify-center gap-2 px-3 pt-1',
+    children: [
+      jsx(IconBtn, {
+        icon: I.repeat,
+        onClick: cycleRepeat,
+        active: repeatMode > 0,
+        size: 14,
+        pad: 4,
+        label: repeatLabel,
+      }),
+      jsx(IconBtn, {
+        icon: I.shuffle,
+        onClick: doShuffle,
+        active: shuffled,
+        size: 14,
+        pad: 4,
+        label: 'Shuffle',
+      }),
+    ],
+  })
+}
+
 function RatePill({ token, video, queryClient }) {
   const likeStatus = video?.likeStatus ?? -1
   const run = (command) => {
@@ -539,6 +599,7 @@ function YtmPane() {
     setSaving(true)
     setSettingsError(null)
     try {
+      if (!isPrivateBaseUrl(url)) throw new Error('Companion Server must be on localhost or a private LAN IP (10.x, 192.168.x, 172.16-31.x, 127.x). Public URLs are blocked for safety.')
       await testConnection(url)
       storage?.set('baseUrl', url)
       if (appId) storage?.set('appId', appId)
@@ -597,6 +658,7 @@ function YtmPane() {
               jsx(NowPlaying, { video, loading: isFetching && !state }),
               jsx(SeekBar, { token: auth.token, progress: player?.videoProgress ?? 0, duration: video?.durationSeconds ?? 0, queryClient }),
               jsx(Transport, { token: auth.token, player, queryClient }),
+              jsx(ExtraControls, { token: auth.token, state, queryClient }),
               jsx(RatePill, { token: auth.token, video, queryClient }),
               jsx(VolumeBar, { token: auth.token, volume: player?.volume, queryClient }),
             ],
@@ -649,8 +711,18 @@ function StatusChip() {
     children: [
       jsx(Icon, { d: isPlaying ? I.pause : I.play, filled: true, size: 10 }),
       jsx('span', {
-        style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+        style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '90px' },
         children: title,
+      }),
+      video?.author
+        ? jsx('span', {
+            style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '70px', color: 'var(--ui-text-quaternary)' },
+            children: ` — ${video.author}`,
+          })
+        : null,
+      jsx('span', {
+        style: { flexShrink: 0, color: 'var(--ui-text-quaternary)' },
+        children: ` · ${fmtTime(player?.videoProgress ?? 0)}/${fmtTime(video?.durationSeconds ?? 0)}`,
       }),
     ],
   })
@@ -659,7 +731,7 @@ function StatusChip() {
 export default {
   id: 'ytm-control',
   name: 'YouTube Music Control',
-  version: '0.2.3',
+  version: '0.3.0',
   register(ctx) {
     storage = ctx.storage
     ctx.registerMany([
