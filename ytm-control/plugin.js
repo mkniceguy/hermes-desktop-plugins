@@ -24,6 +24,7 @@ const APP_VERSION = '0.2.0'
 const POLL_MS = 3_000
 const AUTH_TIMEOUT_MS = 90_000
 
+let pluginCtx = null
 let storage = null
 
 function cfg() {
@@ -169,7 +170,7 @@ const inputStyle = {
   boxSizing: 'border-box',
 }
 
-function IconBtn({ icon, onClick, active, size = 16, pad = 6, circle, disabled, label }) {
+function IconBtn({ icon, onClick, active, size = 16, pad = 6, circle, disabled, label, filled }) {
   return jsx('button', {
     type: 'button',
     'aria-label': label,
@@ -191,7 +192,7 @@ function IconBtn({ icon, onClick, active, size = 16, pad = 6, circle, disabled, 
     },
     onMouseEnter: (e) => { if (!disabled) e.currentTarget.style.background = 'var(--ui-surface-secondary, rgba(127,127,127,0.08))' },
     onMouseLeave: (e) => { e.currentTarget.style.background = 'none' },
-    children: jsx(Icon, { d: icon, filled: active, size }),
+    children: jsx(Icon, { d: icon, filled: (filled ?? true) ? active : false, size }),
   })
 }
 
@@ -438,7 +439,7 @@ function ExtraControls({ token, state, queryClient }) {
   const repeatMode = state?.player?.queue?.repeatMode ?? 0
   const [shuffled, setShuffled] = useState(false)
   const run = (command, data) => {
-    cmd(token, command, data).catch(() => {}).then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
+    apiCommand(token, command, data).catch(() => {}).then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
   }
   const cycleRepeat = () => {
     const next = repeatMode >= 2 ? 0 : repeatMode + 1
@@ -464,6 +465,7 @@ function ExtraControls({ token, state, queryClient }) {
         icon: I.shuffle,
         onClick: doShuffle,
         active: shuffled,
+        filled: false,
         size: 14,
         pad: 4,
         label: 'Shuffle',
@@ -552,6 +554,146 @@ function VolumeBar({ token, volume, queryClient }) {
   })
 }
 
+// Backend-aware helpers
+async function apiPlaylists(token) {
+  if (pluginCtx) {
+    try { return await pluginCtx.rest('/playlists') } catch (e) {}
+  }
+  const c = cfg()
+  const res = await fetch(`${c.baseUrl}/api/v1/playlists`, { headers: hdr(token) })
+  if (!res.ok) throw new Error(`Playlists failed: ${res.status}`)
+  return res.json()
+}
+
+async function apiCommand(token, command, data) {
+  if (pluginCtx) {
+    try {
+      return await pluginCtx.rest('/command', { method: 'POST', body: { command, data } })
+    } catch (e) {}
+  }
+  return cmd(token, command, data)
+}
+
+function QueueList({ token, state, queryClient }) {
+  const items = state?.player?.queue?.items || []
+  const selected = state?.player?.queue?.selectedItemIndex ?? -1
+  const [open, setOpen] = useState(false)
+  if (!items.length) return null
+  const playIndex = (i) => {
+    apiCommand(token, 'playQueueIndex', i).catch(() => {}).then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
+  }
+  return jsxs('div', {
+    className: 'flex flex-col px-3 py-1 gap-1',
+    children: [
+      jsx('button', {
+        type: 'button',
+        onClick: () => setOpen((v) => !v),
+        style: {
+          textAlign: 'left',
+          background: 'none',
+          border: 'none',
+          padding: 0,
+          cursor: 'pointer',
+          color: 'var(--ui-text-secondary)',
+          fontSize: '11px',
+          fontWeight: 600,
+        },
+        children: `${open ? 'Hide' : 'Show'} queue (${items.length})`,
+      }),
+      open
+        ? items.slice(0, 12).map((it, i) =>
+            jsx('button', {
+              key: `${it.videoId || i}-${i}`,
+              type: 'button',
+              onClick: () => playIndex(i),
+              title: it.title,
+              style: {
+                textAlign: 'left',
+                background: i === selected ? 'var(--ui-surface-secondary, rgba(127,127,127,0.08))' : 'none',
+                border: 'none',
+                borderRadius: '4px',
+                padding: '3px 6px',
+                cursor: 'pointer',
+                color: 'var(--ui-text-secondary)',
+                fontSize: '11px',
+              },
+              children: jsxs('div', {
+                className: 'flex items-center gap-2 min-w-0',
+                children: [
+                  jsx('span', { className: 'text-(--ui-text-quaternary)', style: { width: '14px', flexShrink: 0, textAlign: 'right' }, children: String(i + 1) }),
+                  jsx('span', { className: 'truncate', children: it.title || 'Unknown' }),
+                ],
+              }),
+            }, i)
+          )
+        : null,
+    ],
+  })
+}
+
+function PlaylistBrowser({ token, queryClient }) {
+  const [open, setOpen] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [items, setItems] = useState([])
+  const [error, setError] = useState(null)
+  const load = async () => {
+    setLoading(true)
+    setError(null)
+    try { setItems(await apiPlaylists(token) || []) } catch (e) { setError(e?.message || String(e)) } finally { setLoading(false) }
+  }
+  const toggle = () => { const next = !open; setOpen(next); if (next && !items.length) load() }
+  const play = (id) => {
+    apiCommand(token, 'changeVideo', { videoId: null, playlistId: id }).catch(() => {}).then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
+    setOpen(false)
+  }
+  return jsxs('div', {
+    className: 'px-3 py-1',
+    children: [
+      jsx('button', {
+        type: 'button',
+        onClick: toggle,
+        style: {
+          padding: '4px 8px',
+          fontSize: '11px',
+          borderRadius: '6px',
+          border: '1px solid var(--ui-stroke-secondary)',
+          background: 'none',
+          cursor: 'pointer',
+          color: 'var(--ui-text-secondary)',
+        },
+        children: open ? 'Hide playlists' : 'Playlists',
+      }),
+      open
+        ? jsxs('div', {
+            className: 'mt-1 flex flex-col gap-1 max-h-40 overflow-auto',
+            children: [
+              loading ? jsx('div', { className: 'text-xs text-(--ui-text-quaternary)', children: 'Loading…' }) : null,
+              error ? jsx('div', { className: 'text-xs', style: { color: '#f59e0b' }, children: error }) : null,
+              ...items.map((p, i) =>
+                jsx('button', {
+                  key: p.id || i,
+                  type: 'button',
+                  onClick: () => play(p.id),
+                  style: {
+                    textAlign: 'left',
+                    background: 'none',
+                    border: 'none',
+                    borderRadius: '4px',
+                    padding: '3px 6px',
+                    cursor: 'pointer',
+                    color: 'var(--ui-text-secondary)',
+                    fontSize: '11px',
+                  },
+                  children: p.title || p.id,
+                }, i)
+              ),
+            ],
+          })
+        : null,
+    ],
+  })
+}
+
 function YtmPane() {
   const queryClient = useQueryClient()
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -563,9 +705,20 @@ function YtmPane() {
   })
 
   const c = cfg()
+  useEffect(() => {
+    const handler = () => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] })
+    window.addEventListener('ytm-control:state-updated', handler)
+    return () => window.removeEventListener('ytm-control:state-updated', handler)
+  }, [queryClient])
+
   const { data: state, error: stateError, isFetching } = useQuery({
     queryKey: ['ytm', 'state', auth.token, c.baseUrl],
-    queryFn: () => getState(auth.token),
+    queryFn: async () => {
+      if (pluginCtx) {
+        try { return await pluginCtx.rest('/state') } catch (e) {}
+      }
+      return getState(auth.token)
+    },
     enabled: auth.connected && !!auth.token,
     refetchInterval: POLL_MS,
     retry: 3,
@@ -584,6 +737,9 @@ function YtmPane() {
       setAuth((s) => ({ ...s, code }))
       const token = await pollToken(code, AUTH_TIMEOUT_MS)
       storage?.set('token', token)
+      if (pluginCtx) {
+        try { await pluginCtx.rest('/configure', { method: 'POST', body: { baseUrl: cfg().baseUrl, token, appId: cfg().appId } }) } catch (e) {}
+      }
       setAuth({ connected: true, token, connecting: false, code: null, error: null })
     } catch (e) {
       setAuth((s) => ({ ...s, connecting: false, code: null, error: e?.message || String(e) }))
@@ -603,6 +759,9 @@ function YtmPane() {
       await testConnection(url)
       storage?.set('baseUrl', url)
       if (appId) storage?.set('appId', appId)
+      if (pluginCtx) {
+        try { await pluginCtx.rest('/configure', { method: 'POST', body: { baseUrl: url, token: storage?.get('token') || null, appId: appId || undefined } }) } catch (e) {}
+      }
       setSettingsOpen(false)
     } catch (e) {
       setSettingsError(e?.message || String(e))
@@ -659,8 +818,10 @@ function YtmPane() {
               jsx(SeekBar, { token: auth.token, progress: player?.videoProgress ?? 0, duration: video?.durationSeconds ?? 0, queryClient }),
               jsx(Transport, { token: auth.token, player, queryClient }),
               jsx(ExtraControls, { token: auth.token, state, queryClient }),
-              jsx(RatePill, { token: auth.token, video, queryClient }),
               jsx(VolumeBar, { token: auth.token, volume: player?.volume, queryClient }),
+              jsx(QueueList, { token: auth.token, state, queryClient }),
+              jsx(PlaylistBrowser, { token: auth.token, queryClient }),
+              jsx(RatePill, { token: auth.token, video, queryClient }),
             ],
           }),
     ],
@@ -731,9 +892,16 @@ function StatusChip() {
 export default {
   id: 'ytm-control',
   name: 'YouTube Music Control',
-  version: '0.3.0',
+  version: '0.4.0',
   register(ctx) {
+    pluginCtx = ctx
     storage = ctx.storage
+    try {
+      const disposeSocket = ctx.socket('/events', () => {
+        try { window.dispatchEvent(new Event('ytm-control:state-updated')) } catch (e) {}
+      })
+      ctx.onDispose(() => { try { disposeSocket() } catch (e) {} })
+    } catch (e) {}
     ctx.registerMany([
       {
         id: 'pane',
