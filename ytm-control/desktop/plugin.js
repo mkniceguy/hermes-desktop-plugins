@@ -1,128 +1,119 @@
 /**
- * ytm-control — Hermes Desktop Plugin
+ * ytm-control — Hermes Desktop plugin (v0.4.1)
  *
- * Controls YouTube Music Desktop App via its Companion Server API.
- * Now-playing, seek, transport controls, like/dislike, volume.
- * Statusbar mini-chip for quick play/pause.
+ * Controls the YouTube Music Desktop App through its Companion Server API.
+ * Right-side pane: now-playing, seek, transport, repeat/shuffle, like/dislike,
+ * volume, collapsible queue, playlist browser. Statusbar mini-chip for quick
+ * play/pause with the pane closed.
  *
- * v0.2 — release polish:
- *  - Configurable Companion Server URL (settings form, save & test)
- *  - Explicit loading / offline / error states
- *  - Auth flow polls for approval with a timeout and shows the code
- *  - Debounced seek, no mid-drag jumps
- *  - Accessible labels; debug readout removed
+ * ARCHITECTURE (v0.4.1)
+ * ---------------------
+ * This half is presentation only. Every byte of state and every command goes
+ * through the plugin's own backend namespace — /api/plugins/ytm-control/ — via
+ * `ctx.rest`, and every live update arrives as a pushed event via
+ * `host.onEvent`. The renderer NEVER talks to the Companion Server directly.
  *
- * Auth: one-time flow — click Connect, approve in YT Music app, token persists.
+ * That is the whole point of the 0.4.1 rework. In v0.4 this file contained a
+ * second, parallel data path (`fetch` straight at ${baseUrl}/api/v1/…) that ran
+ * alongside the backend one. Consequences: most backend routes were dead code,
+ * and the private-LAN URL guard was unenforceable because the renderer simply
+ * fetched the host itself. The backend now owns the token, the address
+ * validation, and the Socket.IO connection; there is one data path.
+ *
+ * Auth is a one-time flow: press Connect, a code is shown, approve it inside
+ * YT Music Desktop, and the backend stores the token from then on.
  */
 import { Separator, useQuery, useQueryClient, host, haptic } from '@hermes/plugin-sdk'
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
-const DEFAULT_BASE = 'http://localhost:9863'
-const APP_NAME = 'Hermes Desktop'
-const APP_VERSION = '0.2.0'
-const POLL_MS = 3_000
-const AUTH_TIMEOUT_MS = 90_000
+const APP_VERSION = '0.4.1'
+const DEFAULT_BASE = 'http://127.0.0.1:9863'
+const CONFIG_KEY = ['ytm', 'config']
 
 let pluginCtx = null
-let storage = null
 
-function cfg() {
-  const raw = (storage?.get('baseUrl') || DEFAULT_BASE).trim()
-  return {
-    baseUrl: raw.replace(/\/+$/, '') || DEFAULT_BASE,
-    appId: (storage?.get('appId') || 'hermesdesktop01').trim() || 'hermesdesktop01',
-  }
+// ---------------------------------------------------------------------------
+// Backend calls — one data path, scoped to this plugin by construction
+// ---------------------------------------------------------------------------
+
+function rest(path, opts) {
+  if (!pluginCtx) throw new Error('The ytm-control backend is not loaded.')
+  return pluginCtx.rest(path, opts)
 }
 
-function apiUrl(path) {
-  return `${cfg().baseUrl}/api/v1${path}`
+const getConfig = () => rest('/config')
+const saveConfig = (body) => rest('/configure', { method: 'POST', body })
+const probeServer = () => rest('/probe')
+const getHealth = () => rest('/health')
+const requestCode = () => rest('/auth/requestcode', { method: 'POST', body: {} })
+// The Companion Server blocks this call for up to 30 s while the user approves,
+// so the request needs a timeout well above the backend's own 45 s ceiling.
+const requestToken = (code) => rest('/auth/request', { method: 'POST', body: { code }, timeoutMs: 60000 })
+const forgetAuth = () => rest('/auth', { method: 'DELETE' })
+const getState = () => rest('/state')
+const getPlaylists = () => rest('/playlists')
+const sendCommand = (command, data) =>
+  rest('/command', { method: 'POST', body: data === undefined ? { command } : { command, data } })
+
+function errText(e) {
+  const raw = e?.message || String(e)
+  return raw.replace(/^Error:\s*/, '')
 }
 
-function hdr(token) {
-  const h = { 'Content-Type': 'application/json' }
-  if (token) h['Authorization'] = token
-  return h
+/**
+ * Live updates. The backend pushes `plugin.ytm-control.<event>` onto the app's
+ * global event stream; this hooks that stream and refreshes the shared query
+ * cache. (v0.4 used ctx.socket('/events'), which is this plugin's *own* backend
+ * socket namespace — an endpoint that did not exist — so pushes never landed.)
+ */
+function useYtmEvents() {
+  const queryClient = useQueryClient()
+  useEffect(() => {
+    const invalidateState = () => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] })
+    const invalidatePlaylists = () => queryClient.invalidateQueries({ queryKey: ['ytm', 'playlists'] })
+    const disposers = [
+      host.onEvent('plugin.ytm-control.state.updated', invalidateState),
+      host.onEvent('plugin.ytm-control.connection.changed', invalidateState),
+      host.onEvent('plugin.ytm-control.playlists.changed', invalidatePlaylists),
+    ]
+    return () => {
+      for (const dispose of disposers) {
+        try {
+          if (typeof dispose === 'function') dispose()
+        } catch (e) {}
+      }
+    }
+  }, [queryClient])
 }
 
-async function requestCode() {
-  const { appId } = cfg()
-  const res = await fetch(apiUrl('/auth/requestcode'), {
-    method: 'POST',
-    headers: hdr(),
-    body: JSON.stringify({ appId, appName: APP_NAME, appVersion: APP_VERSION }),
+function useYtmConfig() {
+  return useQuery({
+    queryKey: CONFIG_KEY,
+    queryFn: getConfig,
+    staleTime: 10_000,
+    retry: 1,
   })
-  if (!res.ok) throw new Error(`Request code failed: ${res.status}`)
-  const json = await res.json()
-  if (!json?.code) throw new Error('No code returned by Companion Server')
-  return json.code
 }
 
-async function requestToken(code) {
-  const { appId } = cfg()
-  const res = await fetch(apiUrl('/auth/request'), {
-    method: 'POST',
-    headers: hdr(),
-    body: JSON.stringify({ appId, code }),
+function useYtmState(baseUrl, enabled, refetchInterval) {
+  return useQuery({
+    queryKey: ['ytm', 'state', baseUrl || 'default'],
+    queryFn: getState,
+    enabled,
+    // Realtime pushes drive the UI; this interval is only a safety net for a
+    // dropped socket, and the backend throttles its upstream /state calls to
+    // the Companion Server's documented 1-per-5s budget regardless.
+    refetchInterval,
+    retry: 2,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
+    staleTime: 5_000,
   })
-  if (res.status === 408 || res.status === 425 || res.status === 400) return null
-  if (!res.ok) throw new Error(`Request token failed: ${res.status}`)
-  const json = await res.json()
-  return json?.token || null
 }
 
-async function pollToken(code, timeoutMs) {
-  const deadline = Date.now() + (timeoutMs || AUTH_TIMEOUT_MS)
-  while (Date.now() < deadline) {
-    const token = await requestToken(code)
-    if (token) return token
-    await new Promise((r) => setTimeout(r, 1500))
-  }
-  throw new Error('Timed out waiting for approval in YouTube Music Desktop.')
-}
-
-async function getState(token) {
-  const res = await fetch(apiUrl('/state'), { headers: hdr(token) })
-  if (!res.ok) throw new Error(`Get state failed: ${res.status}`)
-  return res.json()
-}
-
-async function cmd(token, command, data) {
-  const body = { command }
-  if (data !== undefined) body.data = data
-  const res = await fetch(apiUrl('/command'), {
-    method: 'POST',
-    headers: hdr(token),
-    body: JSON.stringify(body),
-  })
-  if (!res.ok) throw new Error(`Command failed: ${res.status}`)
-}
-
-function isPrivateBaseUrl(url) {
-  try {
-    const u = new URL(url)
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
-    const h = u.hostname.toLowerCase()
-    if (h === 'localhost') return true
-    if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return false
-    const parts = h.split('.').map(Number)
-    if (parts.some((p) => p < 0 || p > 255)) return false
-    if (parts[0] === 10) return true
-    if (parts[0] === 127) return true
-    if (parts[0] === 192 && parts[1] === 168) return true
-    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true
-    return false
-  } catch (e) {
-    return false
-  }
-}
-
-async function testConnection(url) {
-  const base = url.replace(/\/+$/, '')
-  const res = await fetch(`${base}/api/v1/state`, { headers: hdr() })
-  if (res.status === 404 || res.status >= 500) throw new Error(`HTTP ${res.status}`)
-  return true
-}
+// ---------------------------------------------------------------------------
+// Icons
+// ---------------------------------------------------------------------------
 
 function Icon({ d, filled, size = 16 }) {
   return jsx('svg', {
@@ -176,7 +167,11 @@ function IconBtn({ icon, onClick, active, size = 16, pad = 6, circle, disabled, 
     'aria-label': label,
     title: label,
     disabled: !!disabled,
-    onClick: () => { if (disabled) return; haptic('tap'); onClick() },
+    onClick: () => {
+      if (disabled) return
+      haptic('tap')
+      onClick()
+    },
     style: {
       display: 'inline-flex',
       alignItems: 'center',
@@ -190,13 +185,38 @@ function IconBtn({ icon, onClick, active, size = 16, pad = 6, circle, disabled, 
       opacity: disabled ? 0.4 : 1,
       transition: 'color 120ms ease, background 120ms ease',
     },
-    onMouseEnter: (e) => { if (!disabled) e.currentTarget.style.background = 'var(--ui-surface-secondary, rgba(127,127,127,0.08))' },
-    onMouseLeave: (e) => { e.currentTarget.style.background = 'none' },
+    onMouseEnter: (e) => {
+      if (!disabled) e.currentTarget.style.background = 'var(--ui-surface-secondary, rgba(127,127,127,0.08))'
+    },
+    onMouseLeave: (e) => {
+      e.currentTarget.style.background = 'none'
+    },
     children: jsx(Icon, { d: icon, filled: (filled ?? true) ? active : false, size }),
   })
 }
 
+// ---------------------------------------------------------------------------
+// Chrome
+// ---------------------------------------------------------------------------
+
 function Header({ connected, artist, onDisconnect, onSettings }) {
+  const right = connected
+    ? jsx('button', {
+        type: 'button',
+        onClick: onDisconnect,
+        title: 'Disconnect',
+        'aria-label': 'Disconnect from YouTube Music',
+        style: {
+          background: 'none',
+          border: 'none',
+          cursor: 'pointer',
+          fontSize: '10px',
+          color: 'var(--ui-text-quaternary)',
+          padding: '2px 4px',
+        },
+        children: 'disconnect',
+      })
+    : null
   return jsxs('div', {
     className: 'flex items-center gap-2 px-3 py-2 text-sm font-medium',
     children: [
@@ -207,24 +227,25 @@ function Header({ connected, artist, onDisconnect, onSettings }) {
             children: `— ${artist}`,
           })
         : jsx('span', { className: 'flex-1' }),
-      connected
-        ? jsx('button', {
-            type: 'button',
-            onClick: onDisconnect,
-            title: 'Disconnect',
-            'aria-label': 'Disconnect from YouTube Music',
-            style: {
-              background: 'none',
-              border: 'none',
-              cursor: 'pointer',
-              fontSize: '10px',
-              color: 'var(--ui-text-quaternary)',
-              padding: '2px 4px',
-            },
-            children: 'disconnect',
+      right,
+      jsx(IconBtn, { icon: I.settings, onClick: onSettings, size: 14, pad: 2, label: 'Settings' }),
+    ],
+  })
+}
+
+function Notice({ title, detail, mono }) {
+  return jsxs('div', {
+    className: 'flex flex-col items-center gap-2 px-3 py-6 text-xs text-center',
+    children: [
+      jsx('div', { style: { color: '#f59e0b' }, children: title }),
+      detail ? jsx('div', { className: 'text-(--ui-text-quaternary)', children: detail }) : null,
+      mono
+        ? jsx('div', {
+            className: 'text-(--ui-text-quaternary)',
+            style: { fontFamily: 'monospace', fontSize: '10px' },
+            children: mono,
           })
         : null,
-      jsx(IconBtn, { icon: I.settings, onClick: onSettings, size: 14, pad: 2, label: 'Settings' }),
     ],
   })
 }
@@ -232,13 +253,22 @@ function Header({ connected, artist, onDisconnect, onSettings }) {
 function SettingsForm({ initial, onSave, onCancel, saving, error }) {
   const [url, setUrl] = useState(initial.url)
   const [appId, setAppId] = useState(initial.appId)
+  const { data: health } = useQuery({
+    queryKey: ['ytm', 'health'],
+    queryFn: getHealth,
+    staleTime: 15_000,
+    retry: 1,
+  })
+  const diagnostics = health
+    ? `backend ${health.version} · realtime ${health.realtime ? (health.bridge?.connected ? 'connected' : 'idle') : 'unavailable'}`
+    : null
   return jsxs('div', {
     className: 'flex flex-col gap-2 px-3 py-3 text-xs',
     children: [
       jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'Companion Server connection' }),
       jsx('input', {
         type: 'text',
-        placeholder: 'URL — http://localhost:9863',
+        placeholder: `URL — ${DEFAULT_BASE}`,
         value: url,
         onChange: (e) => setUrl(e.target.value),
         style: inputStyle,
@@ -253,8 +283,12 @@ function SettingsForm({ initial, onSave, onCancel, saving, error }) {
       jsx('div', {
         className: 'text-(--ui-text-quaternary)',
         style: { fontSize: '10px' },
-        children: 'Enable in YT Music Desktop: Settings → Integrations → Companion Server.',
+        children:
+          'Enable in YT Music Desktop: Settings → Integrations → Companion Server. localhost is pinned to 127.0.0.1 (the server does not listen on IPv6).',
       }),
+      diagnostics
+        ? jsx('div', { className: 'text-(--ui-text-quaternary)', style: { fontSize: '10px' }, children: diagnostics })
+        : null,
       error ? jsx('div', { style: { color: '#f59e0b', fontSize: '11px' }, children: error }) : null,
       jsxs('div', {
         className: 'flex gap-2',
@@ -275,14 +309,20 @@ function SettingsForm({ initial, onSave, onCancel, saving, error }) {
             },
             children: saving ? 'Testing…' : 'Save & test',
           }),
-          (initial.url && initial.url !== '')
-            ? jsx('button', {
-                type: 'button',
-                onClick: onCancel,
-                style: { padding: '5px 12px', fontSize: '12px', borderRadius: '6px', border: 'none', background: 'none', cursor: 'pointer', color: 'var(--ui-text-quaternary)' },
-                children: 'Cancel',
-              })
-            : null,
+          jsx('button', {
+            type: 'button',
+            onClick: onCancel,
+            style: {
+              padding: '5px 12px',
+              fontSize: '12px',
+              borderRadius: '6px',
+              border: 'none',
+              background: 'none',
+              cursor: 'pointer',
+              color: 'var(--ui-text-quaternary)',
+            },
+            children: 'Cancel',
+          }),
         ],
       }),
     ],
@@ -317,24 +357,36 @@ function AuthScreen({ onConnect, connecting, code, error }) {
         ? jsxs('div', {
             className: 'text-xs text-(--ui-text-quaternary) text-center',
             children: [
-              'Check the YouTube Music app — approve the connection request.',
-              code ? jsx('div', { style: { marginTop: '4px', fontFamily: 'monospace' }, children: `Code: ${code}` }) : null,
+              'Approve the request in the YouTube Music app.',
+              code
+                ? jsx('div', { style: { marginTop: '4px', fontFamily: 'monospace' }, children: `Code: ${code}` })
+                : null,
             ],
           })
         : null,
       error
-        ? jsx('div', { className: 'text-xs', style: { color: '#f59e0b', textAlign: 'center' }, children: `Error: ${error}` })
+        ? jsx('div', {
+            className: 'text-xs',
+            style: { color: '#f59e0b', textAlign: 'center' },
+            children: errText(error),
+          })
         : null,
     ],
   })
 }
+
+// ---------------------------------------------------------------------------
+// Playback UI
+// ---------------------------------------------------------------------------
 
 function NowPlaying({ video, loading }) {
   if (loading) {
     return jsxs('div', {
       className: 'flex gap-3 px-3 py-2',
       children: [
-        jsx('div', { style: { width: '56px', height: '56px', borderRadius: '4px', backgroundColor: 'var(--ui-stroke-secondary)', flexShrink: 0 } }),
+        jsx('div', {
+          style: { width: '56px', height: '56px', borderRadius: '4px', backgroundColor: 'var(--ui-stroke-secondary)', flexShrink: 0 },
+        }),
         jsxs('div', {
           className: 'min-w-0 flex flex-col justify-center gap-1 flex-1',
           children: [
@@ -374,7 +426,7 @@ function NowPlaying({ video, loading }) {
   })
 }
 
-function SeekBar({ token, progress, duration, queryClient }) {
+function SeekBar({ progress, duration, run }) {
   const [dragging, setDragging] = useState(false)
   const [local, setLocal] = useState(Math.floor(progress || 0))
 
@@ -383,9 +435,8 @@ function SeekBar({ token, progress, duration, queryClient }) {
   }, [progress, dragging])
 
   const commit = (sec) => {
-    cmd(token, 'seekTo', sec).catch(() => {}).then(() => {
-      queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }).then(() => setDragging(false))
-    })
+    run('seekTo', sec)
+    setDragging(false)
   }
 
   return jsxs('div', {
@@ -401,9 +452,10 @@ function SeekBar({ token, progress, duration, queryClient }) {
         'aria-label': 'Seek position',
         onPointerDown: () => setDragging(true),
         onPointerUp: () => commit(local),
-        onTouchEnd: () => commit(local),
+        onKeyDown: (e) => {
+          if (e.key === 'Enter') commit(local)
+        },
         onChange: (e) => setLocal(Number(e.target.value)),
-        onKeyDown: (e) => { if (e.key === 'Enter') commit(local) },
         style: { flex: 1, accentColor: 'var(--ui-accent)', height: '3px', cursor: duration ? 'pointer' : 'default' },
       }),
       jsx('span', { children: fmtTime(duration) }),
@@ -411,11 +463,8 @@ function SeekBar({ token, progress, duration, queryClient }) {
   })
 }
 
-function Transport({ token, player, queryClient }) {
+function Transport({ player, run }) {
   const isPlaying = (player?.trackState ?? -1) === 1
-  const run = (command, data) => {
-    cmd(token, command, data).then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
-  }
   return jsxs('div', {
     className: 'flex items-center justify-center gap-2 px-3 pt-2',
     children: [
@@ -434,36 +483,21 @@ function Transport({ token, player, queryClient }) {
   })
 }
 
-// Extra controls: repeat cycle + shuffle
-function ExtraControls({ token, state, queryClient }) {
+function ExtraControls({ state, run }) {
   const repeatMode = state?.player?.queue?.repeatMode ?? 0
   const [shuffled, setShuffled] = useState(false)
-  const run = (command, data) => {
-    apiCommand(token, command, data).catch(() => {}).then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
-  }
-  const cycleRepeat = () => {
-    const next = repeatMode >= 2 ? 0 : repeatMode + 1
-    run('repeatMode', next)
-  }
-  const doShuffle = () => {
-    setShuffled((v) => !v)
-    run('shuffle')
-  }
+  const cycleRepeat = () => run('repeatMode', repeatMode >= 2 ? 0 : repeatMode + 1)
   const repeatLabel = repeatMode === 2 ? 'Repeat: one' : repeatMode === 1 ? 'Repeat: all' : 'Repeat: off'
   return jsxs('div', {
     className: 'flex items-center justify-center gap-2 px-3 pt-1',
     children: [
-      jsx(IconBtn, {
-        icon: I.repeat,
-        onClick: cycleRepeat,
-        active: repeatMode > 0,
-        size: 14,
-        pad: 4,
-        label: repeatLabel,
-      }),
+      jsx(IconBtn, { icon: I.repeat, onClick: cycleRepeat, active: repeatMode > 0, size: 14, pad: 4, label: repeatLabel }),
       jsx(IconBtn, {
         icon: I.shuffle,
-        onClick: doShuffle,
+        onClick: () => {
+          setShuffled((v) => !v)
+          run('shuffle')
+        },
         active: shuffled,
         filled: false,
         size: 14,
@@ -474,11 +508,8 @@ function ExtraControls({ token, state, queryClient }) {
   })
 }
 
-function RatePill({ token, video, queryClient }) {
+function RatePill({ video, run }) {
   const likeStatus = video?.likeStatus ?? -1
-  const run = (command) => {
-    cmd(token, command).then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
-  }
   return jsx('div', {
     className: 'flex items-center justify-center gap-2 px-3 pb-2 pt-1',
     children: jsx('div', {
@@ -492,96 +523,100 @@ function RatePill({ token, video, queryClient }) {
       children: [
         jsx('div', {
           style: { padding: '4px 12px', display: 'flex' },
-          children: jsx(IconBtn, {
-            icon: I.thumbUp,
-            onClick: () => run('toggleLike'),
-            active: likeStatus === 2,
-            size: 14,
-            pad: 2,
-            label: 'Like',
-          }),
+          children: jsx(IconBtn, { icon: I.thumbUp, onClick: () => run('toggleLike'), active: likeStatus === 2, size: 14, pad: 2, label: 'Like' }),
         }),
         jsx('div', { style: { width: '1px', alignSelf: 'stretch', backgroundColor: 'var(--ui-stroke-secondary)' } }),
         jsx('div', {
           style: { padding: '4px 12px', display: 'flex' },
-          children: jsx(IconBtn, {
-            icon: I.thumbDown,
-            onClick: () => run('toggleDislike'),
-            active: likeStatus === 0,
-            size: 14,
-            pad: 2,
-            label: 'Dislike',
-          }),
+          children: jsx(IconBtn, { icon: I.thumbDown, onClick: () => run('toggleDislike'), active: likeStatus === 0, size: 14, pad: 2, label: 'Dislike' }),
         }),
       ],
     }),
   })
 }
 
-function VolumeBar({ token, volume, queryClient }) {
+function VolumeBar({ volume, run }) {
   const [dragging, setDragging] = useState(false)
   const [local, setLocal] = useState(volume ?? 50)
-  useEffect(() => { if (!dragging) setLocal(volume ?? 50) }, [volume, dragging])
+  useEffect(() => {
+    if (!dragging) setLocal(volume ?? 50)
+  }, [volume, dragging])
 
   const commit = (v) => {
-    cmd(token, 'setVolume', v).catch(() => {}).then(() => {
-      queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }).then(() => setDragging(false))
-    })
+    run('setVolume', v)
+    setDragging(false)
   }
 
   return jsxs('div', {
     className: 'flex items-center gap-2 px-3 py-1 text-xs',
     children: [
-      IconBtn({ icon: I.volume, onClick: () => cmd(token, 'mute').then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] })), size: 14, pad: 2, label: 'Mute' }),
+      IconBtn({ icon: I.volume, onClick: () => run('mute'), size: 14, pad: 2, label: 'Mute' }),
       jsx('input', {
         type: 'range',
         min: 0,
         max: 100,
-        value: dragging ? local : (volume ?? 50),
+        value: dragging ? local : volume ?? 50,
         'aria-label': 'Volume',
         onPointerDown: () => setDragging(true),
         onPointerUp: () => commit(local),
-        onTouchEnd: () => commit(local),
-        onChange: (e) => { setDragging(true); setLocal(Number(e.target.value)) },
+        onKeyDown: (e) => {
+          if (e.key === 'Enter') commit(local)
+        },
+        onChange: (e) => {
+          setDragging(true)
+          setLocal(Number(e.target.value))
+        },
         style: { flex: 1, accentColor: 'var(--ui-accent)', height: '3px', cursor: 'pointer' },
       }),
       jsx('span', {
         className: 'text-(--ui-text-quaternary)',
         style: { width: '20px', textAlign: 'right' },
-        children: String(dragging ? local : (volume ?? 0)),
+        children: String(dragging ? local : volume ?? 0),
       }),
     ],
   })
 }
 
-// Backend-aware helpers
-async function apiPlaylists(token) {
-  if (pluginCtx) {
-    try { return await pluginCtx.rest('/playlists') } catch (e) {}
-  }
-  const c = cfg()
-  const res = await fetch(`${c.baseUrl}/api/v1/playlists`, { headers: hdr(token) })
-  if (!res.ok) throw new Error(`Playlists failed: ${res.status}`)
-  return res.json()
-}
-
-async function apiCommand(token, command, data) {
-  if (pluginCtx) {
-    try {
-      return await pluginCtx.rest('/command', { method: 'POST', body: { command, data } })
-    } catch (e) {}
-  }
-  return cmd(token, command, data)
-}
-
-function QueueList({ token, state, queryClient }) {
+function QueueList({ state, run }) {
   const items = state?.player?.queue?.items || []
   const selected = state?.player?.queue?.selectedItemIndex ?? -1
   const [open, setOpen] = useState(false)
   if (!items.length) return null
-  const playIndex = (i) => {
-    apiCommand(token, 'playQueueIndex', i).catch(() => {}).then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
-  }
+
+  const rows = open
+    ? items.slice(0, 12).map((item, i) =>
+        jsx(
+          'button',
+          {
+            type: 'button',
+            onClick: () => run('playQueueIndex', i),
+            title: item.title,
+            style: {
+              textAlign: 'left',
+              background: i === selected ? 'var(--ui-surface-secondary, rgba(127,127,127,0.08))' : 'none',
+              border: 'none',
+              borderRadius: '4px',
+              padding: '3px 6px',
+              cursor: 'pointer',
+              color: 'var(--ui-text-secondary)',
+              fontSize: '11px',
+            },
+          },
+          jsxs('div', {
+            className: 'flex items-center gap-2 min-w-0',
+            children: [
+              jsx('span', {
+                className: 'text-(--ui-text-quaternary)',
+                style: { width: '14px', flexShrink: 0, textAlign: 'right' },
+                children: String(i + 1),
+              }),
+              jsx('span', { className: 'truncate', children: item.title || 'Unknown' }),
+            ],
+          })
+        )
+      )
+    : []
+
   return jsxs('div', {
     className: 'flex flex-col px-3 py-1 gap-1',
     children: [
@@ -600,58 +635,53 @@ function QueueList({ token, state, queryClient }) {
         },
         children: `${open ? 'Hide' : 'Show'} queue (${items.length})`,
       }),
-      open
-        ? items.slice(0, 12).map((it, i) =>
-            jsx('button', {
-              key: `${it.videoId || i}-${i}`,
-              type: 'button',
-              onClick: () => playIndex(i),
-              title: it.title,
-              style: {
-                textAlign: 'left',
-                background: i === selected ? 'var(--ui-surface-secondary, rgba(127,127,127,0.08))' : 'none',
-                border: 'none',
-                borderRadius: '4px',
-                padding: '3px 6px',
-                cursor: 'pointer',
-                color: 'var(--ui-text-secondary)',
-                fontSize: '11px',
-              },
-              children: jsxs('div', {
-                className: 'flex items-center gap-2 min-w-0',
-                children: [
-                  jsx('span', { className: 'text-(--ui-text-quaternary)', style: { width: '14px', flexShrink: 0, textAlign: 'right' }, children: String(i + 1) }),
-                  jsx('span', { className: 'truncate', children: it.title || 'Unknown' }),
-                ],
-              }),
-            }, i)
-          )
-        : null,
+      ...rows,
     ],
   })
 }
 
-function PlaylistBrowser({ token, queryClient }) {
+function PlaylistBrowser({ run }) {
   const [open, setOpen] = useState(false)
-  const [loading, setLoading] = useState(false)
-  const [items, setItems] = useState([])
-  const [error, setError] = useState(null)
-  const load = async () => {
-    setLoading(true)
-    setError(null)
-    try { setItems(await apiPlaylists(token) || []) } catch (e) { setError(e?.message || String(e)) } finally { setLoading(false) }
-  }
-  const toggle = () => { const next = !open; setOpen(next); if (next && !items.length) load() }
-  const play = (id) => {
-    apiCommand(token, 'changeVideo', { videoId: null, playlistId: id }).catch(() => {}).then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
-    setOpen(false)
-  }
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['ytm', 'playlists'],
+    queryFn: getPlaylists,
+    enabled: open,
+    staleTime: 60_000,
+    retry: 1,
+  })
+  const items = Array.isArray(data) ? data : []
+  const rows = open
+    ? items.map((p, i) =>
+        jsx(
+          'button',
+          {
+            type: 'button',
+            onClick: () => {
+              run('changeVideo', { videoId: null, playlistId: p.id })
+              setOpen(false)
+            },
+            style: {
+              textAlign: 'left',
+              background: 'none',
+              border: 'none',
+              borderRadius: '4px',
+              padding: '3px 6px',
+              cursor: 'pointer',
+              color: 'var(--ui-text-secondary)',
+              fontSize: '11px',
+            },
+          },
+          p.title || p.id
+        )
+      )
+    : []
+
   return jsxs('div', {
     className: 'px-3 py-1',
     children: [
       jsx('button', {
         type: 'button',
-        onClick: toggle,
+        onClick: () => setOpen((v) => !v),
         style: {
           padding: '4px 8px',
           fontSize: '11px',
@@ -667,26 +697,13 @@ function PlaylistBrowser({ token, queryClient }) {
         ? jsxs('div', {
             className: 'mt-1 flex flex-col gap-1 max-h-40 overflow-auto',
             children: [
-              loading ? jsx('div', { className: 'text-xs text-(--ui-text-quaternary)', children: 'Loading…' }) : null,
-              error ? jsx('div', { className: 'text-xs', style: { color: '#f59e0b' }, children: error }) : null,
-              ...items.map((p, i) =>
-                jsx('button', {
-                  key: p.id || i,
-                  type: 'button',
-                  onClick: () => play(p.id),
-                  style: {
-                    textAlign: 'left',
-                    background: 'none',
-                    border: 'none',
-                    borderRadius: '4px',
-                    padding: '3px 6px',
-                    cursor: 'pointer',
-                    color: 'var(--ui-text-secondary)',
-                    fontSize: '11px',
-                  },
-                  children: p.title || p.id,
-                }, i)
-              ),
+              isLoading
+                ? jsx('div', { className: 'text-xs text-(--ui-text-quaternary)', children: 'Loading… (can take up to 30s)' })
+                : null,
+              error
+                ? jsx('div', { className: 'text-xs', style: { color: '#f59e0b' }, children: errText(error) })
+                : null,
+              ...rows,
             ],
           })
         : null,
@@ -694,167 +711,186 @@ function PlaylistBrowser({ token, queryClient }) {
   })
 }
 
+// ---------------------------------------------------------------------------
+// Pane
+// ---------------------------------------------------------------------------
+
 function YtmPane() {
   const queryClient = useQueryClient()
+  useYtmEvents()
+
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [saving, setSaving] = useState(false)
   const [settingsError, setSettingsError] = useState(null)
-  const [auth, setAuth] = useState(() => {
-    const saved = storage?.get('token')
-    return { connected: !!saved, token: saved || null, connecting: false, code: null, error: null }
+  const [auth, setAuth] = useState({ connecting: false, code: null, error: null })
+
+  const { data: config, error: configError, isLoading: configLoading } = useYtmConfig()
+  const baseUrl = config?.baseUrl
+  const authorised = !!config?.hasToken
+
+  const { data: state, error: stateError, isFetching } = useYtmState(baseUrl, authorised, 20_000)
+  const { data: health } = useQuery({
+    queryKey: ['ytm', 'health'],
+    queryFn: getHealth,
+    enabled: authorised,
+    staleTime: 15_000,
+    retry: 1,
   })
 
-  const c = cfg()
-  useEffect(() => {
-    const handler = () => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] })
-    window.addEventListener('ytm-control:state-updated', handler)
-    return () => window.removeEventListener('ytm-control:state-updated', handler)
-  }, [queryClient])
+  const refresh = () => {
+    queryClient.invalidateQueries({ queryKey: ['ytm', 'config'] })
+    queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] })
+  }
 
-  const { data: state, error: stateError, isFetching } = useQuery({
-    queryKey: ['ytm', 'state', auth.token, c.baseUrl],
-    queryFn: async () => {
-      if (pluginCtx) {
-        try { return await pluginCtx.rest('/state') } catch (e) {}
-      }
-      return getState(auth.token)
-    },
-    enabled: auth.connected && !!auth.token,
-    refetchInterval: POLL_MS,
-    retry: 3,
-    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 4000),
-    staleTime: Math.floor(POLL_MS / 2),
-  })
+  // One place that turns a command into a backend call plus a cache refresh.
+  const run = (command, data) => {
+    sendCommand(command, data)
+      .catch(() => {})
+      .then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
+  }
 
-  const offline = !!stateError && !state
-  const player = state?.player
-  const video = state?.video
-
-  const handleConnect = async () => {
-    setAuth((s) => ({ ...s, connecting: true, error: null, code: null }))
+  const connect = async () => {
+    setAuth({ connecting: true, code: null, error: null })
     try {
-      const code = await requestCode()
-      setAuth((s) => ({ ...s, code }))
-      const token = await pollToken(code, AUTH_TIMEOUT_MS)
-      storage?.set('token', token)
-      if (pluginCtx) {
-        try { await pluginCtx.rest('/configure', { method: 'POST', body: { baseUrl: cfg().baseUrl, token, appId: cfg().appId } }) } catch (e) {}
-      }
-      setAuth({ connected: true, token, connecting: false, code: null, error: null })
+      const res = await requestCode()
+      setAuth({ connecting: true, code: res?.code || null, error: null })
+      await requestToken(res?.code)
+      setAuth({ connecting: false, code: null, error: null })
+      refresh()
     } catch (e) {
-      setAuth((s) => ({ ...s, connecting: false, code: null, error: e?.message || String(e) }))
+      setAuth({ connecting: false, code: null, error: e })
     }
   }
 
-  const handleDisconnect = () => {
-    storage?.remove('token')
-    setAuth({ connected: false, token: null, connecting: false, code: null, error: null })
+  const disconnect = async () => {
+    try {
+      await forgetAuth()
+    } catch (e) {}
+    refresh()
   }
 
-  const handleSaveSettings = async (url, appId) => {
+  const saveSettings = async (url, appId) => {
     setSaving(true)
     setSettingsError(null)
     try {
-      if (!isPrivateBaseUrl(url)) throw new Error('Companion Server must be on localhost or a private LAN IP (10.x, 192.168.x, 172.16-31.x, 127.x). Public URLs are blocked for safety.')
-      await testConnection(url)
-      storage?.set('baseUrl', url)
-      if (appId) storage?.set('appId', appId)
-      if (pluginCtx) {
-        try { await pluginCtx.rest('/configure', { method: 'POST', body: { baseUrl: url, token: storage?.get('token') || null, appId: appId || undefined } }) } catch (e) {}
-      }
+      // The backend owns address validation (and the LAN guard), so surface its
+      // message verbatim rather than duplicating the rules here.
+      await saveConfig({ baseUrl: url, appId })
+      await probeServer()
+      refresh()
       setSettingsOpen(false)
     } catch (e) {
-      setSettingsError(e?.message || String(e))
+      setSettingsError(errText(e))
     } finally {
       setSaving(false)
     }
   }
 
+  const header = jsx(Header, {
+    connected: authorised,
+    artist: state?.video?.author,
+    onDisconnect: disconnect,
+    onSettings: () => setSettingsOpen((v) => !v),
+  })
+
+  let body
+  if (configError) {
+    // The backend half is not loaded: either the plugin is missing from
+    // plugins.enabled in config.yaml, or importing plugin_api.py failed.
+    body = jsx(Notice, {
+      title: 'Plugin backend unavailable.',
+      detail: 'Enable ytm-control in plugins.enabled (config.yaml), then restart Hermes.',
+      mono: errText(configError),
+    })
+  } else if (configLoading && !config) {
+    body = jsx(Notice, { title: 'Starting…' })
+  } else if (!authorised) {
+    body = jsx('div', {
+      children: jsx(AuthScreen, {
+        onConnect: connect,
+        connecting: auth.connecting,
+        code: auth.code,
+        error: auth.error,
+      }),
+    })
+  } else if (stateError && !state) {
+    body = jsx(Notice, {
+      title: 'Cannot reach the Companion Server.',
+      detail: `Check YT Music Desktop is running and the Companion Server is enabled at ${baseUrl}.`,
+      mono: errText(stateError),
+    })
+  } else {
+    const player = state?.player
+    body = jsxs('div', {
+      className: 'flex flex-col',
+      children: [
+        health && health.realtime === false
+          ? jsx('div', {
+              className: 'text-xs px-3 pb-1',
+              style: { color: '#f59e0b' },
+              children: 'Realtime unavailable (python-socketio not installed) — falling back to polling.',
+            })
+          : null,
+        jsx(NowPlaying, { video: state?.video, loading: isFetching && !state }),
+        jsx(SeekBar, { progress: player?.videoProgress ?? 0, duration: state?.video?.durationSeconds ?? 0, run }),
+        jsx(Transport, { player, run }),
+        jsx(ExtraControls, { state, run }),
+        jsx(VolumeBar, { volume: player?.volume, run }),
+        jsx(QueueList, { state, run }),
+        jsx(PlaylistBrowser, { run }),
+        jsx(RatePill, { video: state?.video, run }),
+      ],
+    })
+  }
+
   return jsxs('div', {
     className: 'flex h-full flex-col text-sm',
     children: [
-      jsx(Header, {
-        connected: auth.connected,
-        artist: video?.author,
-        onDisconnect: handleDisconnect,
-        onSettings: () => setSettingsOpen((v) => !v),
-      }),
+      header,
       jsx(Separator, {}),
       settingsOpen
         ? jsx(SettingsForm, {
-            initial: { url: c.baseUrl, appId: c.appId },
-            onSave: handleSaveSettings,
+            initial: { url: baseUrl || DEFAULT_BASE, appId: config?.appId || 'hermesdesktop01' },
+            onSave: saveSettings,
             onCancel: () => setSettingsOpen(false),
             saving,
             error: settingsError,
           })
         : null,
       settingsOpen ? jsx(Separator, {}) : null,
-      !auth.connected
-        ? jsx(AuthScreen, {
-            onConnect: handleConnect,
-            connecting: auth.connecting,
-            code: auth.code,
-            error: auth.error,
-          })
-        : offline
-        ? jsxs('div', {
-            className: 'flex flex-col items-center gap-2 px-3 py-6 text-xs text-center',
-            children: [
-              jsx('div', { style: { color: '#f59e0b' }, children: 'Cannot reach the Companion Server.' }),
-              jsx('div', {
-                className: 'text-(--ui-text-quaternary)',
-                children: `Check YT Music Desktop is running and the Companion Server is enabled at ${c.baseUrl}.`,
-              }),
-              stateError?.message
-                ? jsx('div', { className: 'text-(--ui-text-quaternary)', style: { fontFamily: 'monospace', fontSize: '10px' }, children: stateError.message })
-                : null,
-            ],
-          })
-        : jsxs('div', {
-            className: 'flex flex-col',
-            children: [
-              jsx(NowPlaying, { video, loading: isFetching && !state }),
-              jsx(SeekBar, { token: auth.token, progress: player?.videoProgress ?? 0, duration: video?.durationSeconds ?? 0, queryClient }),
-              jsx(Transport, { token: auth.token, player, queryClient }),
-              jsx(ExtraControls, { token: auth.token, state, queryClient }),
-              jsx(VolumeBar, { token: auth.token, volume: player?.volume, queryClient }),
-              jsx(QueueList, { token: auth.token, state, queryClient }),
-              jsx(PlaylistBrowser, { token: auth.token, queryClient }),
-              jsx(RatePill, { token: auth.token, video, queryClient }),
-            ],
-          }),
+      body,
     ],
   })
 }
 
+// ---------------------------------------------------------------------------
+// Statusbar chip
+// ---------------------------------------------------------------------------
+
 function StatusChip() {
   const queryClient = useQueryClient()
-  const token = storage?.get('token')
-  const c = cfg()
-  const { data: state } = useQuery({
-    queryKey: ['ytm', 'state', token, c.baseUrl],
-    queryFn: () => getState(token),
-    enabled: !!token,
-    refetchInterval: POLL_MS,
-    retry: 2,
-    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 4000),
-    staleTime: Math.floor(POLL_MS / 2),
-  })
-  if (!token) return null
+  useYtmEvents()
+  const { data: config } = useYtmConfig()
+  const authorised = !!config?.hasToken
+  const { data: state } = useYtmState(config?.baseUrl, authorised, 30_000)
+
+  if (!authorised) return null
   const player = state?.player
   const video = state?.video
-  const isPlaying = (player?.trackState ?? -1) === 1
   const title = video?.title
   if (!title) return null
+  const isPlaying = (player?.trackState ?? -1) === 1
 
   const toggle = () => {
-    cmd(token, 'playPause').then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
+    haptic('tap')
+    sendCommand('playPause')
+      .catch(() => {})
+      .then(() => queryClient.invalidateQueries({ queryKey: ['ytm', 'state'] }))
   }
 
   return jsxs('button', {
     type: 'button',
-    onClick: () => { haptic('tap'); toggle() },
+    onClick: toggle,
     title: `${isPlaying ? 'Pause' : 'Play'} — ${title}`,
     'aria-label': `${isPlaying ? 'Pause' : 'Play'} ${title}`,
     style: {
@@ -877,7 +913,13 @@ function StatusChip() {
       }),
       video?.author
         ? jsx('span', {
-            style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '70px', color: 'var(--ui-text-quaternary)' },
+            style: {
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              maxWidth: '70px',
+              color: 'var(--ui-text-quaternary)',
+            },
             children: ` — ${video.author}`,
           })
         : null,
@@ -892,16 +934,9 @@ function StatusChip() {
 export default {
   id: 'ytm-control',
   name: 'YouTube Music Control',
-  version: '0.4.0',
+  version: APP_VERSION,
   register(ctx) {
     pluginCtx = ctx
-    storage = ctx.storage
-    try {
-      const disposeSocket = ctx.socket('/events', () => {
-        try { window.dispatchEvent(new Event('ytm-control:state-updated')) } catch (e) {}
-      })
-      ctx.onDispose(() => { try { disposeSocket() } catch (e) {} })
-    } catch (e) {}
     ctx.registerMany([
       {
         id: 'pane',

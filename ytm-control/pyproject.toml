@@ -1,0 +1,30 @@
+# Dependency declaration for the ytm-control Hermes plugin.
+#
+# THIS FILE IS LOAD-BEARING. It is what makes the plugin's Python dependencies
+# survive Hermes updates.
+#
+# Hermes' package manager reads a plugin's dependency declaration from exactly
+# three places: plugin.yaml / plugin.yml (`pip_dependencies`), plugin.json, or
+# this pyproject.toml (`[project].dependencies`). It does NOT read
+# requirements.txt — that file is inert, which is why v0.4's requirements.txt
+# was never installed by anything.
+#
+# Only a *declared* plugin joins the dependency workspace, and only workspace
+# members have their specs installed into the committed environment venv and
+# re-installed on every dependency sync / update. v0.4 declared nothing, so
+# python-socketio and httpx were only ever present because someone installed
+# them by hand into the old in-tree venv — and the plugin broke the moment the
+# runtime moved to a PM-built environment.
+#
+# There is deliberately NO [build-system] table: that marks this as a
+# metadata-only workspace member. It carries dependencies and nothing is built
+# or importable from it. `requires-python` is also deliberately omitted, so uv
+# inherits the application's own constraint instead of intersecting with it.
+[project]
+name = "ytm-control"
+version = "0.4.1"
+description = "Control the YouTube Music Desktop Companion Server from Hermes."
+dependencies = [
+    "python-socketio[asyncio_client]>=5.11",
+    "httpx>=0.27",
+]
