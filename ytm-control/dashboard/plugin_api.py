@@ -40,11 +40,35 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 PLUGIN_ID = "ytm-control"
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 
 APP_NAME = "Hermes Desktop"
 DEFAULT_BASE_URL = "http://127.0.0.1:9863"
 DEFAULT_APP_ID = "hermesdesktop01"
+
+# The realtime API is a Socket.IO **namespace**, not a URL path.
+#
+# The Companion Server deliberately disconnects anything that lands on the
+# default namespace: see ytmdesktop/src/main/integrations/companion-server/
+# index.ts — `io.on("connection", socket => socket.disconnect())`. And
+# python-socketio does NOT treat a path in the connect URL as a namespace, so
+# connecting to ".../api/v1/realtime" silently lands on "/" and is killed.
+#
+# The namespace must therefore be named explicitly in BOTH places:
+#   * ``connect(..., namespaces=[REALTIME_NAMESPACE])``
+#   * every handler: ``@sio.on("state-update", namespace=REALTIME_NAMESPACE)``
+#
+# Getting this wrong produces the worst possible failure mode: the socket
+# reports connected=True with a session id and no error, but is silently killed
+# and delivers zero events. Upstream issue #1531 documents exactly this
+# (maintainer: "The companion server disconnects any connections to the default
+# namespace of `/` so that behavior is intentional").
+REALTIME_NAMESPACE = "/api/v1/realtime"
+
+# A cached snapshot older than this is not served: the pane would freeze on it
+# forever if the socket went quiet. 10 s keeps the worst-case staleness bounded
+# while staying far inside the server's documented 1-per-5s /state budget.
+STATE_MAX_AGE = 10.0
 
 # --- Upstream Companion Server budget -------------------------------------
 # The Companion Server rate-limits every route and documents the limits so
@@ -193,6 +217,7 @@ _bridge: Dict[str, Any] = {
     "task": None,
     "connected": False,
     "state": None,
+    "state_at": 0.0,
     "last_error": None,
     "generation": 0,
 }
@@ -224,36 +249,41 @@ async def _bridge_loop(generation: int) -> None:
 
         sio = socketio.AsyncClient(reconnection=False)
 
-        @sio.event
+        # Every handler MUST carry the namespace — a handler registered on the
+        # default namespace never fires for events emitted on this one.
+        @sio.event(namespace=REALTIME_NAMESPACE)
         async def connect(*_args: Any, **_kwargs: Any) -> None:
             _bridge["connected"] = True
             _bridge["last_error"] = None
             _broadcast("connection.changed", {"connected": True})
 
-        @sio.event
+        @sio.event(namespace=REALTIME_NAMESPACE)
         async def disconnect(*_args: Any, **_kwargs: Any) -> None:
             _bridge["connected"] = False
             _broadcast("connection.changed", {"connected": False})
 
-        @sio.on("state-update")
+        @sio.on("state-update", namespace=REALTIME_NAMESPACE)
         async def state_update(*args: Any, **_kwargs: Any) -> None:
             state = args[0] if args else None
             if isinstance(state, dict):
                 _bridge["state"] = state
+                _bridge["state_at"] = time.monotonic()
                 _broadcast("state.updated", state)
 
-        @sio.on("playlist-created")
+        @sio.on("playlist-created", namespace=REALTIME_NAMESPACE)
         async def playlist_created(*_args: Any, **_kwargs: Any) -> None:
             _broadcast("playlists.changed", {})
 
-        @sio.on("playlist-deleted")
+        @sio.on("playlist-deleted", namespace=REALTIME_NAMESPACE)
         async def playlist_deleted(*_args: Any, **_kwargs: Any) -> None:
             _broadcast("playlists.changed", {})
 
         try:
+            # NOTE: the namespace goes in `namespaces=`, never in the URL.
             await sio.connect(
-                f"{base}/api/v1/realtime",
+                base,
                 auth={"token": token},
+                namespaces=[REALTIME_NAMESPACE],
                 transports=["websocket"],
                 wait_timeout=10,
             )
@@ -583,13 +613,24 @@ async def auth_forget() -> Dict[str, Any]:
 
 @router.get("/state")
 async def get_state() -> Dict[str, Any]:
-    """Cached player state, hydrated over REST at most once per 5 s."""
+    """Player state: the pushed snapshot while it is fresh, REST otherwise.
+
+    v0.4.1 served `_bridge["state"]` whenever it was set, with no age check.
+    When the socket went quiet that turned into a permanently frozen snapshot —
+    the pane stopped updating entirely, which is exactly the v0.4.2 bug report.
+    A stale snapshot is now refreshed over REST (throttled below to the
+    server's own 1-per-5s budget), and only served as a last resort if the
+    refresh fails.
+    """
     cfg = _require_config()
     cached = _bridge.get("state")
-    if isinstance(cached, dict):
+    fresh = (time.monotonic() - float(_bridge.get("state_at") or 0.0)) < STATE_MAX_AGE
+    if isinstance(cached, dict) and fresh:
         return cached
     data = await _hydrate_state(cfg)
     if data is None:
+        if isinstance(cached, dict):
+            return cached  # stale beats nothing
         raise HTTPException(
             status_code=502, detail="No state available from the Companion Server yet."
         )

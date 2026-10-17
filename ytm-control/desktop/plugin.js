@@ -27,7 +27,7 @@ import { Separator, useQuery, useQueryClient, host, haptic } from '@hermes/plugi
 import { useState, useEffect } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
-const APP_VERSION = '0.4.1'
+const APP_VERSION = '0.4.2'
 const DEFAULT_BASE = 'http://127.0.0.1:9863'
 const CONFIG_KEY = ['ytm', 'config']
 
