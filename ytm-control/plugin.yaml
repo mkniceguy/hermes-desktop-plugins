@@ -1,0 +1,14 @@
+name: ytm-control
+version: "0.5.1"
+description: >-
+  Control the YouTube Music Desktop App (v2.1.0+) through its Companion
+  Server API. A right-side pane with now-playing, seek, transport controls,
+  shuffle/repeat, like/dislike, volume + mute, an interactive queue, a
+  playlist browser, Ctrl+K command-palette actions, and a statusbar mini-chip.
+  The backend (dashboard/plugin_api.py) is the single source of truth — it owns
+  the Companion Server URL, the auth token, and the Socket.IO connection; the
+  desktop half is presentation only and talks to /api/plugins/ytm-control/.
+author: Dave Knepper
+requires_env: []
+provides_tools: []
+provides_hooks: []
