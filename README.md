@@ -4,16 +4,17 @@ Hermes Desktop plugins for [Hermes Agent](https://hermes-agent.nousresearch.com/
 
 ## Plugins
 
-### ytm-control
+### ytm-control (v0.5.0)
 
-Controls the [YouTube Music Desktop App](https://ytmdesktop.app/) through its
-Companion Server API. Right-side pane with now-playing (thumbnail/title/artist/album),
-seek slider, SVG transport controls (prev / play-pause / next), shuffle + repeat,
-like/dislike pill with live status, volume slider, collapsible queue, playlist
-browser, and a statusbar mini-chip (play/pause + track title) for quick control
-with the pane closed.
+Controls the [YouTube Music Desktop App](https://ytmdesktop.app/) (v2.1.0+) through its
+Companion Server API. Right-side pane with now-playing (hi-res thumbnail, title, artist,
+album, live/buffering/ad status badge), seek slider, SVG transport controls (prev /
+play-pause / next), shuffle + repeat (with Repeat-One indicator), like/dislike pill with
+live status, volume slider with two-way mute/unmute toggle, interactive queue (with track
+author, duration, reorder up/down, and remove), playlist browser (play now or append to
+queue), `Ctrl+K` Command Palette actions, and a statusbar mini-chip.
 
-## Architecture (v0.4.1)
+## Architecture (v0.5.0)
 
 One plugin folder, two halves, **one data path**:
 

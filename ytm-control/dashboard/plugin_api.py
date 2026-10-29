@@ -1,4 +1,4 @@
-"""ytm-control v0.4.1 — backend bridge for the YouTube Music Desktop Companion Server.
+"""ytm-control v0.5.0 — backend bridge for the YouTube Music Desktop Companion Server.
 
 This backend is the *single source of truth* for the plugin. It owns:
 
@@ -31,8 +31,9 @@ import asyncio
 import json
 import os
 import re
+import stat
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -40,7 +41,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 PLUGIN_ID = "ytm-control"
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 
 APP_NAME = "Hermes Desktop"
 DEFAULT_BASE_URL = "http://127.0.0.1:9863"
@@ -81,6 +82,30 @@ PLAYLISTS_TIMEOUT = 45.0      # upstream can take up to 30 s
 AUTH_TIMEOUT = 45.0           # upstream blocks up to 30 s awaiting user approval
 BACKOFF_MIN = 1.0
 BACKOFF_MAX = 30.0
+
+# All 20 Companion Server v1 commands supported as of YTMDesktop v2.1.0.
+AllowedCommand = Literal[
+    "playPause",
+    "play",
+    "pause",
+    "volumeUp",
+    "volumeDown",
+    "setVolume",
+    "mute",
+    "unmute",
+    "seekTo",
+    "next",
+    "previous",
+    "repeatMode",
+    "shuffle",
+    "playQueueIndex",
+    "changeVideo",
+    "toggleLike",
+    "toggleDislike",
+    "queueAdd",
+    "queueRemove",
+    "queueMove",
+]
 
 # ---------------------------------------------------------------------------
 # Paths / persisted config
@@ -128,8 +153,24 @@ def save_config(cfg: Dict[str, Any]) -> None:
     # Atomic: never leave a half-written config behind for the next reader.
     tmp = path.parent / (path.name + ".tmp")
     tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    try:
+        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
     os.replace(tmp, path)
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
     _config_cache = cfg
+
+
+def _redact_error(text: str, token: Optional[str] = None) -> str:
+    """Ensure auth tokens never leak into diagnostic strings or HTTP error details."""
+    cleaned = text or ""
+    if token and len(token) >= 6:
+        cleaned = cleaned.replace(token, "[REDACTED]")
+    return cleaned[:240]
 
 
 # ---------------------------------------------------------------------------
@@ -189,8 +230,60 @@ def _socketio_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Event push to the desktop half
+# Payload trimming & event push to the desktop half
 # ---------------------------------------------------------------------------
+
+
+def _slim_queue_item(item: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(item, dict):
+        return None
+    # Strip heavy `counterparts` and oversized thumbnail arrays on every queue
+    # entry so 1s progress ticks don't push ~96 KB across the gateway event bus.
+    thumbs = item.get("thumbnails")
+    slim_thumbs = thumbs[:2] if isinstance(thumbs, list) else []
+    return {
+        "title": item.get("title"),
+        "author": item.get("author"),
+        "duration": item.get("duration"),
+        "selected": item.get("selected"),
+        "videoId": item.get("videoId"),
+        "thumbnails": slim_thumbs,
+    }
+
+
+def _slim_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a compact copy of the Companion Server state payload (~96 KB -> ~6 KB)."""
+    if not isinstance(state, dict):
+        return state
+    player = state.get("player")
+    if not isinstance(player, dict):
+        return state
+    queue = player.get("queue")
+    if not isinstance(queue, dict):
+        return state
+
+    raw_items = queue.get("items")
+    items = [s for x in (raw_items if isinstance(raw_items, list) else []) if (s := _slim_queue_item(x)) is not None]
+    raw_automix = queue.get("automixItems")
+    automix_count = len(raw_automix) if isinstance(raw_automix, list) else 0
+
+    slim_queue = {
+        "autoplay": queue.get("autoplay"),
+        "items": items,
+        "automixCount": automix_count,
+        "isGenerating": queue.get("isGenerating"),
+        "isInfinite": queue.get("isInfinite"),
+        "repeatMode": queue.get("repeatMode"),
+        "selectedItemIndex": queue.get("selectedItemIndex"),
+        "shuffleEnabled": bool(queue.get("shuffleEnabled", False)),
+    }
+    return {
+        **state,
+        "player": {
+            **player,
+            "queue": slim_queue,
+        },
+    }
 
 
 def _broadcast(event: str, payload: Optional[Dict[str, Any]] = None) -> None:
@@ -221,6 +314,14 @@ _bridge: Dict[str, Any] = {
     "last_error": None,
     "generation": 0,
 }
+
+
+def _record_state(raw_state: Dict[str, Any]) -> Dict[str, Any]:
+    slim = _slim_state(raw_state)
+    _bridge["state"] = slim
+    _bridge["state_at"] = time.monotonic()
+    _broadcast("state.updated", slim)
+    return slim
 
 
 async def _bridge_loop(generation: int) -> None:
@@ -266,9 +367,7 @@ async def _bridge_loop(generation: int) -> None:
         async def state_update(*args: Any, **_kwargs: Any) -> None:
             state = args[0] if args else None
             if isinstance(state, dict):
-                _bridge["state"] = state
-                _bridge["state_at"] = time.monotonic()
-                _broadcast("state.updated", state)
+                _record_state(state)
 
         @sio.on("playlist-created", namespace=REALTIME_NAMESPACE)
         async def playlist_created(*_args: Any, **_kwargs: Any) -> None:
@@ -292,7 +391,7 @@ async def _bridge_loop(generation: int) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - any transport failure retries
-            _bridge["last_error"] = f"{type(exc).__name__}: {exc}"[:200]
+            _bridge["last_error"] = _redact_error(f"{type(exc).__name__}: {exc}", token)
         finally:
             _bridge["connected"] = False
             try:
@@ -341,8 +440,24 @@ router = APIRouter(dependencies=[Depends(_bridge_dependency)])
 
 
 # ---------------------------------------------------------------------------
-# Upstream HTTP
+# Upstream HTTP (pooled client + rate-limit lock)
 # ---------------------------------------------------------------------------
+
+_http_client: Optional[httpx.AsyncClient] = None
+_http_client_loop: Any = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    """Return a pooled AsyncClient bound to the current running event loop."""
+    global _http_client, _http_client_loop
+    loop = asyncio.get_running_loop()
+    if _http_client is None or _http_client.is_closed or _http_client_loop is not loop:
+        _http_client = httpx.AsyncClient(
+            timeout=COMMAND_TIMEOUT,
+            limits=httpx.Limits(max_keepalive_connections=4, max_connections=10),
+        )
+        _http_client_loop = loop
+    return _http_client
 
 
 def _require_config() -> Dict[str, Any]:
@@ -363,18 +478,25 @@ async def _upstream(
     json_body: Any = None,
 ) -> Any:
     url = f"{cfg['baseUrl']}/api/v1{path}"
-    headers = {"Authorization": cfg["token"], "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            res = await client.request(method, url, headers=headers, json=json_body)
-        except httpx.TimeoutException:
-            raise HTTPException(
-                status_code=504, detail="The Companion Server did not answer in time."
-            )
-        except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"Companion Server unreachable: {exc}")
+    token = cfg["token"]
+    headers = {"Authorization": token, "Content-Type": "application/json"}
+    client = _get_http_client()
+    try:
+        res = await client.request(method, url, headers=headers, json=json_body, timeout=timeout)
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504, detail="The Companion Server did not answer in time."
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=_redact_error(f"Companion Server unreachable: {exc}", token),
+        )
     if res.status_code >= 400:
-        raise HTTPException(status_code=res.status_code, detail=res.text[:300])
+        raise HTTPException(
+            status_code=res.status_code,
+            detail=_redact_error(res.text[:300], token),
+        )
     if not res.content:
         return None
     try:
@@ -384,21 +506,35 @@ async def _upstream(
 
 
 _state_fetch_at = 0.0
+_state_lock: Optional[asyncio.Lock] = None
+_state_lock_loop: Any = None
+
+
+def _get_state_lock() -> asyncio.Lock:
+    global _state_lock, _state_lock_loop
+    loop = asyncio.get_running_loop()
+    if _state_lock is None or _state_lock_loop is not loop:
+        _state_lock = asyncio.Lock()
+        _state_lock_loop = loop
+    return _state_lock
 
 
 async def _hydrate_state(cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Fetch state over REST, but never faster than the upstream limit."""
+    """Fetch state over REST, serialized and throttled to the upstream 1-per-5s limit."""
     global _state_fetch_at
-    now = time.monotonic()
-    if now - _state_fetch_at < STATE_MIN_INTERVAL:
-        return _bridge.get("state")
-    _state_fetch_at = now
-    data = await _upstream("GET", "/state", cfg)
-    if isinstance(data, dict):
-        _bridge["state"] = data
-        _broadcast("state.updated", data)
-        return data
-    return None
+    async with _get_state_lock():
+        now = time.monotonic()
+        cached = _bridge.get("state")
+        fresh = (now - float(_bridge.get("state_at") or 0.0)) < STATE_MAX_AGE
+        if isinstance(cached, dict) and fresh:
+            return cached
+        if now - _state_fetch_at < STATE_MIN_INTERVAL:
+            return cached if isinstance(cached, dict) else None
+        _state_fetch_at = now
+        data = await _upstream("GET", "/state", cfg)
+        if isinstance(data, dict):
+            return _record_state(data)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +556,7 @@ class RequestTokenBody(BaseModel):
 
 
 class CommandBody(BaseModel):
-    command: str
+    command: AllowedCommand
     data: Any = None
 
 
@@ -465,13 +601,13 @@ async def probe() -> Dict[str, Any]:
     """
     cfg = load_config() or {}
     base = cfg.get("baseUrl") or DEFAULT_BASE_URL
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        try:
-            res = await client.get(f"{base}/metadata")
-        except httpx.HTTPError as exc:
-            raise HTTPException(
-                status_code=502, detail=f"No Companion Server answered at {base} ({exc})."
-            )
+    client = _get_http_client()
+    try:
+        res = await client.get(f"{base}/metadata", timeout=5.0)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"No Companion Server answered at {base} ({exc})."
+        )
     if res.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"{base} answered HTTP {res.status_code}.")
     try:
@@ -494,10 +630,10 @@ async def configure(body: ConfigureBody) -> Dict[str, Any]:
 
     if body.appId is not None:
         app_id = body.appId.strip()
-        if app_id and not re.fullmatch(r"[a-z0-9]{2,32}", app_id):
+        if app_id and not re.fullmatch(r"[a-z0-9_\-]{2,32}", app_id):
             raise HTTPException(
                 status_code=400,
-                detail="App ID must be 2-32 lowercase alphanumeric characters.",
+                detail="App ID must be 2-32 lowercase alphanumeric characters, hyphens, or underscores.",
             )
         cfg["appId"] = app_id or DEFAULT_APP_ID
 
@@ -513,6 +649,7 @@ async def configure(body: ConfigureBody) -> Dict[str, Any]:
     if (moved or renamed) and cfg.get("token"):
         cfg.pop("token", None)
         _bridge["state"] = None
+        _bridge["state_at"] = 0.0
 
     save_config(cfg)
     _restart_bridge()
@@ -540,11 +677,15 @@ async def auth_request_code(body: RequestCodeBody | None = None) -> Dict[str, An
     save_config(cfg)
 
     payload = {"appId": cfg["appId"], "appName": APP_NAME, "appVersion": VERSION}
-    async with httpx.AsyncClient(timeout=COMMAND_TIMEOUT) as client:
-        try:
-            res = await client.post(f"{cfg['baseUrl']}/api/v1/auth/requestcode", json=payload)
-        except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"Companion Server unreachable: {exc}")
+    client = _get_http_client()
+    try:
+        res = await client.post(
+            f"{cfg['baseUrl']}/api/v1/auth/requestcode",
+            json=payload,
+            timeout=COMMAND_TIMEOUT,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Companion Server unreachable: {exc}")
     if res.status_code >= 400:
         raise HTTPException(
             status_code=502,
@@ -570,17 +711,21 @@ async def auth_request(body: RequestTokenBody) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="A pairing code is required.")
 
     payload = {"appId": cfg.get("appId") or DEFAULT_APP_ID, "code": code}
-    async with httpx.AsyncClient(timeout=AUTH_TIMEOUT) as client:
-        try:
-            res = await client.post(f"{cfg['baseUrl']}/api/v1/auth/request", json=payload)
-        except httpx.TimeoutException:
-            raise HTTPException(
-                status_code=408,
-                detail="Timed out waiting for approval in YT Music Desktop. "
-                "Approve the request there, then try again.",
-            )
-        except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"Companion Server unreachable: {exc}")
+    client = _get_http_client()
+    try:
+        res = await client.post(
+            f"{cfg['baseUrl']}/api/v1/auth/request",
+            json=payload,
+            timeout=AUTH_TIMEOUT,
+        )
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=408,
+            detail="Timed out waiting for approval in YT Music Desktop. "
+            "Approve the request there, then try again.",
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Companion Server unreachable: {exc}")
 
     denied = HTTPException(
         status_code=403,
@@ -607,6 +752,7 @@ async def auth_forget() -> Dict[str, Any]:
     cfg.pop("token", None)
     save_config(cfg)
     _bridge["state"] = None
+    _bridge["state_at"] = 0.0
     _restart_bridge()
     return {"ok": True, "hasToken": False}
 

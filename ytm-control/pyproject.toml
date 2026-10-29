@@ -22,7 +22,7 @@
 # inherits the application's own constraint instead of intersecting with it.
 [project]
 name = "ytm-control"
-version = "0.4.2"
+version = "0.5.0"
 description = "Control the YouTube Music Desktop Companion Server from Hermes."
 dependencies = [
     "python-socketio[asyncio_client]>=5.11",

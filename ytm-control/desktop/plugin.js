@@ -1,12 +1,12 @@
 /**
- * ytm-control — Hermes Desktop plugin (v0.4.1)
+ * ytm-control — Hermes Desktop plugin (v0.5.0)
  *
  * Controls the YouTube Music Desktop App through its Companion Server API.
  * Right-side pane: now-playing, seek, transport, repeat/shuffle, like/dislike,
- * volume, collapsible queue, playlist browser. Statusbar mini-chip for quick
- * play/pause with the pane closed.
+ * volume + mute toggle, interactive queue (reorder/remove), playlist browser
+ * (play or add to queue), command-palette actions, and statusbar mini-chip.
  *
- * ARCHITECTURE (v0.4.1)
+ * ARCHITECTURE (v0.5.0)
  * ---------------------
  * This half is presentation only. Every byte of state and every command goes
  * through the plugin's own backend namespace — /api/plugins/ytm-control/ — via
@@ -23,13 +23,14 @@
  * Auth is a one-time flow: press Connect, a code is shown, approve it inside
  * YT Music Desktop, and the backend stores the token from then on.
  */
-import { Separator, useQuery, useQueryClient, host, haptic } from '@hermes/plugin-sdk'
+import { Separator, useQuery, useQueryClient, queryClient as globalQueryClient, host, haptic, PALETTE_AREA } from '@hermes/plugin-sdk'
 import { useState, useEffect } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
-const APP_VERSION = '0.4.2'
+const APP_VERSION = '0.5.0'
 const DEFAULT_BASE = 'http://127.0.0.1:9863'
 const CONFIG_KEY = ['ytm', 'config']
+const WARN_COLOR = 'var(--ui-warning, var(--ui-accent))'
 
 let pluginCtx = null
 
@@ -139,9 +140,24 @@ const I = {
   thumbUp: 'M7 22V11H2v11h5zm2 0h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 2 7.59 8.59C7.22 8.95 7 9.45 7 10v10c0 1.1.9 2 2 2z',
   thumbDown: 'M17 2v11h5V2h-5zm-2 0H6c-.83 0-1.54.5-1.84 1.22L1.14 10.27c-.09.23-.14.47-.14.73v2c0 1.1.9 2 2 2h6.31l-.95 4.57-.03.32c0 .41.17.79.44 1.06L9.83 22l6.59-6.59c.36-.36.58-.86.58-1.41V4c0-1.1-.9-2-2-2z',
   volume: 'M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z',
+  volumeMute: 'M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z',
   settings: 'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm8.94 3.06a1.5 1.5 0 0 0-.64-2.5l-1.1-.22a7.97 7.97 0 0 0-.56-1.36l.63-.94a1.5 1.5 0 0 0-.19-1.9l-.85-.85a1.5 1.5 0 0 0-1.9-.19l-.94.63c-.44-.22-.9-.4-1.36-.56l-.22-1.1a1.5 1.5 0 0 0-2.5-.64h-1.2a1.5 1.5 0 0 0-2.5.64l-.22 1.1c-.46.16-.92.34-1.36.56l-.94-.63a1.5 1.5 0 0 0-1.9.19l-.85.85a1.5 1.5 0 0 0-.19 1.9l.63.94c-.22.44-.4.9-.56 1.36l-1.1.22a1.5 1.5 0 0 0-.64 2.5v1.2a1.5 1.5 0 0 0 .64 2.5l1.1.22c.16.46.34.92.56 1.36l-.63.94a1.5 1.5 0 0 0 .19 1.9l.85.85a1.5 1.5 0 0 0 1.9.19l.94-.63c.44.22.9.4 1.36.56l.22 1.1a1.5 1.5 0 0 0 2.5.64h1.2a1.5 1.5 0 0 0 2.5-.64l.22-1.1c.46-.16.92-.34 1.36-.56l.94.63a1.5 1.5 0 0 0 1.9-.19l.85-.85a1.5 1.5 0 0 0 .19-1.9l-.63-.94c.22-.44.4-.9.56-1.36l1.1-.22a1.5 1.5 0 0 0 .64-2.5v-1.2z',
   repeat: 'M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z',
   shuffle: 'M16 3h5v5M4 20L21 3M21 16v5h-5M4 4l5 5',
+  plus: 'M12 5v14M5 12h14',
+  close: 'M18 6L6 18M6 6l12 12',
+  up: 'M18 15l-6-6-6 6',
+  down: 'M6 9l6 6 6-6',
+}
+
+function pickThumbnail(thumbnails, targetSize = 180) {
+  if (!Array.isArray(thumbnails) || !thumbnails.length) return null
+  // Prefer the smallest thumbnail >= targetSize (e.g. 180x180 or 226x226 for crisp 2x/3x cover art),
+  // falling back to the largest available (or base64 data URL when offline in v2.1.0).
+  const sorted = [...thumbnails].filter((t) => t && t.url).sort((a, b) => (a.width || 0) - (b.width || 0))
+  if (!sorted.length) return null
+  const hiRes = sorted.find((t) => (t.width || 0) >= targetSize)
+  return (hiRes || sorted[sorted.length - 1]).url
 }
 
 function fmtTime(s) {
@@ -237,7 +253,7 @@ function Notice({ title, detail, mono }) {
   return jsxs('div', {
     className: 'flex flex-col items-center gap-2 px-3 py-6 text-xs text-center',
     children: [
-      jsx('div', { style: { color: '#f59e0b' }, children: title }),
+      jsx('div', { style: { color: WARN_COLOR }, children: title }),
       detail ? jsx('div', { className: 'text-(--ui-text-quaternary)', children: detail }) : null,
       mono
         ? jsx('div', {
@@ -289,7 +305,7 @@ function SettingsForm({ initial, onSave, onCancel, saving, error }) {
       diagnostics
         ? jsx('div', { className: 'text-(--ui-text-quaternary)', style: { fontSize: '10px' }, children: diagnostics })
         : null,
-      error ? jsx('div', { style: { color: '#f59e0b', fontSize: '11px' }, children: error }) : null,
+      error ? jsx('div', { style: { color: WARN_COLOR, fontSize: '11px' }, children: error }) : null,
       jsxs('div', {
         className: 'flex gap-2',
         children: [
@@ -367,7 +383,7 @@ function AuthScreen({ onConnect, connecting, code, error }) {
       error
         ? jsx('div', {
             className: 'text-xs',
-            style: { color: '#f59e0b', textAlign: 'center' },
+            style: { color: WARN_COLOR, textAlign: 'center' },
             children: errText(error),
           })
         : null,
@@ -379,7 +395,7 @@ function AuthScreen({ onConnect, connecting, code, error }) {
 // Playback UI
 // ---------------------------------------------------------------------------
 
-function NowPlaying({ video, loading }) {
+function NowPlaying({ video, player, loading }) {
   if (loading) {
     return jsxs('div', {
       className: 'flex gap-3 px-3 py-2',
@@ -399,7 +415,10 @@ function NowPlaying({ video, loading }) {
     })
   }
   if (!video) return null
-  const thumb = video.thumbnails?.[0]?.url
+  const thumb = pickThumbnail(video.thumbnails, 180)
+  const adPlaying = !!player?.adPlaying
+  const isBuffering = (player?.trackState ?? -1) === 2
+  const badgeText = adPlaying ? 'Ad' : isBuffering ? 'Buffering…' : video.isLive ? 'Live' : null
   return jsxs('div', {
     className: 'flex gap-3 px-3 py-2',
     children: [
@@ -413,9 +432,27 @@ function NowPlaying({ video, loading }) {
             style: { width: '56px', height: '56px', borderRadius: '4px', backgroundColor: 'var(--ui-stroke-secondary)', flexShrink: 0 },
           }),
       jsxs('div', {
-        className: 'min-w-0 flex flex-col justify-center gap-0.5',
+        className: 'min-w-0 flex flex-col justify-center gap-0.5 flex-1',
         children: [
-          jsx('div', { className: 'text-sm font-medium truncate', children: video.title || 'Unknown' }),
+          jsxs('div', {
+            className: 'flex items-center gap-1.5 min-w-0',
+            children: [
+              jsx('div', { className: 'text-sm font-medium truncate flex-1', children: video.title || 'Unknown' }),
+              badgeText
+                ? jsx('span', {
+                    style: {
+                      fontSize: '9px',
+                      padding: '1px 5px',
+                      borderRadius: '999px',
+                      border: '1px solid var(--ui-stroke-secondary)',
+                      color: adPlaying ? WARN_COLOR : 'var(--ui-text-tertiary)',
+                      flexShrink: 0,
+                    },
+                    children: badgeText,
+                  })
+                : null,
+            ],
+          }),
           jsx('div', { className: 'text-xs text-(--ui-text-tertiary) truncate', children: video.author || '' }),
           video.album
             ? jsx('div', { className: 'text-xs text-(--ui-text-quaternary) truncate', children: video.album })
@@ -426,7 +463,7 @@ function NowPlaying({ video, loading }) {
   })
 }
 
-function SeekBar({ progress, duration, run }) {
+function SeekBar({ progress, duration, disabled, run }) {
   const [dragging, setDragging] = useState(false)
   const [local, setLocal] = useState(Math.floor(progress || 0))
 
@@ -439,6 +476,8 @@ function SeekBar({ progress, duration, run }) {
     setDragging(false)
   }
 
+  const canSeek = Boolean(duration && !disabled)
+
   return jsxs('div', {
     className: 'px-3 py-1 flex items-center gap-2 text-[10px] text-(--ui-text-quaternary)',
     children: [
@@ -448,7 +487,7 @@ function SeekBar({ progress, duration, run }) {
         min: 0,
         max: Math.floor(duration || 0),
         value: dragging ? local : Math.floor(progress || 0),
-        disabled: !duration,
+        disabled: !canSeek,
         'aria-label': 'Seek position',
         onPointerDown: () => setDragging(true),
         onPointerUp: () => commit(local),
@@ -456,7 +495,7 @@ function SeekBar({ progress, duration, run }) {
           if (e.key === 'Enter') commit(local)
         },
         onChange: (e) => setLocal(Number(e.target.value)),
-        style: { flex: 1, accentColor: 'var(--ui-accent)', height: '3px', cursor: duration ? 'pointer' : 'default' },
+        style: { flex: 1, accentColor: 'var(--ui-accent)', height: '3px', cursor: canSeek ? 'pointer' : 'default' },
       }),
       jsx('span', { children: fmtTime(duration) }),
     ],
@@ -485,24 +524,41 @@ function Transport({ player, run }) {
 
 function ExtraControls({ state, run }) {
   const repeatMode = state?.player?.queue?.repeatMode ?? 0
-  const [shuffled, setShuffled] = useState(false)
+  const shuffleEnabled = Boolean(state?.player?.queue?.shuffleEnabled)
   const cycleRepeat = () => run('repeatMode', repeatMode >= 2 ? 0 : repeatMode + 1)
   const repeatLabel = repeatMode === 2 ? 'Repeat: one' : repeatMode === 1 ? 'Repeat: all' : 'Repeat: off'
   return jsxs('div', {
     className: 'flex items-center justify-center gap-2 px-3 pt-1',
     children: [
-      jsx(IconBtn, { icon: I.repeat, onClick: cycleRepeat, active: repeatMode > 0, size: 14, pad: 4, label: repeatLabel }),
+      jsxs('div', {
+        style: { position: 'relative', display: 'inline-flex' },
+        children: [
+          jsx(IconBtn, { icon: I.repeat, onClick: cycleRepeat, active: repeatMode > 0, size: 14, pad: 4, label: repeatLabel }),
+          repeatMode === 2
+            ? jsx('span', {
+                style: {
+                  position: 'absolute',
+                  right: '1px',
+                  bottom: '0px',
+                  fontSize: '8px',
+                  fontWeight: 700,
+                  lineHeight: 1,
+                  color: 'var(--ui-accent)',
+                  pointerEvents: 'none',
+                },
+                children: '1',
+              })
+            : null,
+        ],
+      }),
       jsx(IconBtn, {
         icon: I.shuffle,
-        onClick: () => {
-          setShuffled((v) => !v)
-          run('shuffle')
-        },
-        active: shuffled,
+        onClick: () => run('shuffle'),
+        active: shuffleEnabled,
         filled: false,
         size: 14,
         pad: 4,
-        label: 'Shuffle',
+        label: shuffleEnabled ? 'Shuffle queue (enabled)' : 'Shuffle queue',
       }),
     ],
   })
@@ -535,7 +591,7 @@ function RatePill({ video, run }) {
   })
 }
 
-function VolumeBar({ volume, run }) {
+function VolumeBar({ volume, muted, run }) {
   const [dragging, setDragging] = useState(false)
   const [local, setLocal] = useState(volume ?? 50)
   useEffect(() => {
@@ -543,14 +599,26 @@ function VolumeBar({ volume, run }) {
   }, [volume, dragging])
 
   const commit = (v) => {
+    if (muted && v > 0) run('unmute')
     run('setVolume', v)
     setDragging(false)
+  }
+
+  const toggleMute = () => {
+    run(muted ? 'unmute' : 'mute')
   }
 
   return jsxs('div', {
     className: 'flex items-center gap-2 px-3 py-1 text-xs',
     children: [
-      IconBtn({ icon: I.volume, onClick: () => run('mute'), size: 14, pad: 2, label: 'Mute' }),
+      jsx(IconBtn, {
+        icon: muted ? I.volumeMute : I.volume,
+        onClick: toggleMute,
+        active: !!muted,
+        size: 14,
+        pad: 2,
+        label: muted ? 'Unmute' : 'Mute',
+      }),
       jsx('input', {
         type: 'range',
         min: 0,
@@ -566,12 +634,18 @@ function VolumeBar({ volume, run }) {
           setDragging(true)
           setLocal(Number(e.target.value))
         },
-        style: { flex: 1, accentColor: 'var(--ui-accent)', height: '3px', cursor: 'pointer' },
+        style: {
+          flex: 1,
+          accentColor: 'var(--ui-accent)',
+          height: '3px',
+          cursor: 'pointer',
+          opacity: muted && !dragging ? 0.5 : 1,
+        },
       }),
       jsx('span', {
         className: 'text-(--ui-text-quaternary)',
-        style: { width: '20px', textAlign: 'right' },
-        children: String(dragging ? local : volume ?? 0),
+        style: { width: '24px', textAlign: 'right' },
+        children: muted && !dragging ? 'mute' : String(dragging ? local : volume ?? 0),
       }),
     ],
   })
@@ -583,36 +657,103 @@ function QueueList({ state, run }) {
   const [open, setOpen] = useState(false)
   if (!items.length) return null
 
+  const moveItem = (fromIndex, toIndex) => {
+    if (toIndex < 0 || toIndex >= items.length || fromIndex === toIndex) return
+    run('queueMove', { fromIndex, toIndex })
+  }
+
   const rows = open
-    ? items.slice(0, 12).map((item, i) =>
-        jsx(
-          'button',
+    ? items.map((item, i) =>
+        jsxs(
+          'div',
           {
-            type: 'button',
-            onClick: () => run('playQueueIndex', i),
-            title: item.title,
+            className: 'flex items-center gap-1 min-w-0',
             style: {
-              textAlign: 'left',
-              background: i === selected ? 'var(--ui-surface-secondary, rgba(127,127,127,0.08))' : 'none',
-              border: 'none',
+              background: i === selected ? 'var(--ui-surface-secondary, rgba(127,127,127,0.12))' : 'none',
               borderRadius: '4px',
-              padding: '3px 6px',
-              cursor: 'pointer',
-              color: 'var(--ui-text-secondary)',
-              fontSize: '11px',
+              padding: '2px 4px',
             },
-          },
-          jsxs('div', {
-            className: 'flex items-center gap-2 min-w-0',
             children: [
-              jsx('span', {
-                className: 'text-(--ui-text-quaternary)',
-                style: { width: '14px', flexShrink: 0, textAlign: 'right' },
-                children: String(i + 1),
+              jsx('button', {
+                type: 'button',
+                onClick: () => run('playQueueIndex', i),
+                title: `${item.title || 'Unknown'}${item.author ? ` — ${item.author}` : ''}`,
+                style: {
+                  flex: 1,
+                  minWidth: 0,
+                  textAlign: 'left',
+                  background: 'none',
+                  border: 'none',
+                  padding: '2px 2px',
+                  cursor: 'pointer',
+                  color: i === selected ? 'var(--ui-accent)' : 'var(--ui-text-primary, var(--foreground))',
+                  fontSize: '12px',
+                  fontWeight: i === selected ? 600 : 400,
+                },
+                children: jsxs('div', {
+                  className: 'flex items-center gap-2 min-w-0',
+                  children: [
+                    jsx('span', {
+                      style: {
+                        width: '16px',
+                        flexShrink: 0,
+                        textAlign: 'right',
+                        fontSize: '10px',
+                        color: 'var(--ui-text-tertiary)',
+                      },
+                      children: String(i + 1),
+                    }),
+                    jsxs('div', {
+                      className: 'min-w-0 flex-1',
+                      children: [
+                        jsx('div', { className: 'truncate', children: item.title || 'Unknown' }),
+                        item.author
+                          ? jsx('div', {
+                              className: 'truncate',
+                              style: { fontSize: '10px', color: 'var(--ui-text-secondary)' },
+                              children: item.author,
+                            })
+                          : null,
+                      ],
+                    }),
+                    item.duration
+                      ? jsx('span', {
+                          style: { fontSize: '10px', flexShrink: 0, color: 'var(--ui-text-secondary)' },
+                          children: item.duration,
+                        })
+                      : null,
+                  ],
+                }),
               }),
-              jsx('span', { className: 'truncate', children: item.title || 'Unknown' }),
+              jsx(IconBtn, {
+                icon: I.up,
+                onClick: () => moveItem(i, i - 1),
+                disabled: i === 0,
+                filled: false,
+                size: 11,
+                pad: 2,
+                label: 'Move up',
+              }),
+              jsx(IconBtn, {
+                icon: I.down,
+                onClick: () => moveItem(i, i + 1),
+                disabled: i >= items.length - 1,
+                filled: false,
+                size: 11,
+                pad: 2,
+                label: 'Move down',
+              }),
+              jsx(IconBtn, {
+                icon: I.close,
+                onClick: () => run('queueRemove', i),
+                filled: false,
+                size: 11,
+                pad: 2,
+                label: 'Remove from queue',
+              }),
             ],
-          })
+          },
+          `${item.videoId || 'q'}-${i}`
         )
       )
     : []
@@ -627,20 +768,25 @@ function QueueList({ state, run }) {
           textAlign: 'left',
           background: 'none',
           border: 'none',
-          padding: 0,
+          padding: '2px 0',
           cursor: 'pointer',
-          color: 'var(--ui-text-secondary)',
-          fontSize: '11px',
+          color: 'var(--ui-text-primary, var(--foreground))',
+          fontSize: '12px',
           fontWeight: 600,
         },
         children: `${open ? 'Hide' : 'Show'} queue (${items.length})`,
       }),
-      ...rows,
+      open
+        ? jsx('div', {
+            className: 'flex flex-col gap-0.5 max-h-52 overflow-y-auto',
+            children: rows,
+          })
+        : null,
     ],
   })
 }
 
-function PlaylistBrowser({ run }) {
+function PlaylistBrowser({ state, run }) {
   const [open, setOpen] = useState(false)
   const { data, isLoading, error } = useQuery({
     queryKey: ['ytm', 'playlists'],
@@ -650,28 +796,52 @@ function PlaylistBrowser({ run }) {
     retry: 1,
   })
   const items = Array.isArray(data) ? data : []
+  const queueLen = state?.player?.queue?.items?.length ?? 0
   const rows = open
     ? items.map((p, i) =>
-        jsx(
-          'button',
+        jsxs(
+          'div',
           {
-            type: 'button',
-            onClick: () => {
-              run('changeVideo', { videoId: null, playlistId: p.id })
-              setOpen(false)
-            },
-            style: {
-              textAlign: 'left',
-              background: 'none',
-              border: 'none',
-              borderRadius: '4px',
-              padding: '3px 6px',
-              cursor: 'pointer',
-              color: 'var(--ui-text-secondary)',
-              fontSize: '11px',
-            },
+            className: 'flex items-center gap-1 min-w-0',
+            children: [
+              jsx('button', {
+                type: 'button',
+                onClick: () => {
+                  run('changeVideo', { videoId: null, playlistId: p.id })
+                  setOpen(false)
+                },
+                title: `Play ${p.title || p.id}`,
+                style: {
+                  flex: 1,
+                  minWidth: 0,
+                  textAlign: 'left',
+                  background: 'none',
+                  border: 'none',
+                  borderRadius: '4px',
+                  padding: '3px 6px',
+                  cursor: 'pointer',
+                  color: 'var(--ui-text-primary, var(--foreground))',
+                  fontSize: '12px',
+                },
+                onMouseEnter: (e) => {
+                  e.currentTarget.style.background = 'var(--ui-surface-secondary, rgba(127,127,127,0.1))'
+                },
+                onMouseLeave: (e) => {
+                  e.currentTarget.style.background = 'none'
+                },
+                children: jsx('span', { className: 'truncate block', children: p.title || p.id }),
+              }),
+              jsx(IconBtn, {
+                icon: I.plus,
+                onClick: () => run('queueAdd', { playlistId: p.id, index: queueLen }),
+                filled: false,
+                size: 12,
+                pad: 3,
+                label: `Add "${p.title || p.id}" to queue`,
+              }),
+            ],
           },
-          p.title || p.id
+          p.id || i
         )
       )
     : []
@@ -683,13 +853,14 @@ function PlaylistBrowser({ run }) {
         type: 'button',
         onClick: () => setOpen((v) => !v),
         style: {
-          padding: '4px 8px',
-          fontSize: '11px',
+          padding: '4px 10px',
+          fontSize: '12px',
+          fontWeight: 500,
           borderRadius: '6px',
           border: '1px solid var(--ui-stroke-secondary)',
           background: 'none',
           cursor: 'pointer',
-          color: 'var(--ui-text-secondary)',
+          color: 'var(--ui-text-primary, var(--foreground))',
         },
         children: open ? 'Hide playlists' : 'Playlists',
       }),
@@ -698,10 +869,10 @@ function PlaylistBrowser({ run }) {
             className: 'mt-1 flex flex-col gap-1 max-h-40 overflow-auto',
             children: [
               isLoading
-                ? jsx('div', { className: 'text-xs text-(--ui-text-quaternary)', children: 'Loading… (can take up to 30s)' })
+                ? jsx('div', { className: 'text-xs text-(--ui-text-secondary)', children: 'Loading… (can take up to 30s)' })
                 : null,
               error
-                ? jsx('div', { className: 'text-xs', style: { color: '#f59e0b' }, children: errText(error) })
+                ? jsx('div', { className: 'text-xs', style: { color: WARN_COLOR }, children: errText(error) })
                 : null,
               ...rows,
             ],
@@ -827,17 +998,22 @@ function YtmPane() {
         health && health.realtime === false
           ? jsx('div', {
               className: 'text-xs px-3 pb-1',
-              style: { color: '#f59e0b' },
+              style: { color: WARN_COLOR },
               children: 'Realtime unavailable (python-socketio not installed) — falling back to polling.',
             })
           : null,
-        jsx(NowPlaying, { video: state?.video, loading: isFetching && !state }),
-        jsx(SeekBar, { progress: player?.videoProgress ?? 0, duration: state?.video?.durationSeconds ?? 0, run }),
+        jsx(NowPlaying, { video: state?.video, player, loading: isFetching && !state }),
+        jsx(SeekBar, {
+          progress: player?.videoProgress ?? 0,
+          duration: state?.video?.durationSeconds ?? 0,
+          disabled: !!player?.adPlaying,
+          run,
+        }),
         jsx(Transport, { player, run }),
         jsx(ExtraControls, { state, run }),
-        jsx(VolumeBar, { volume: player?.volume, run }),
+        jsx(VolumeBar, { volume: player?.volume, muted: player?.muted, run }),
         jsx(QueueList, { state, run }),
-        jsx(PlaylistBrowser, { run }),
+        jsx(PlaylistBrowser, { state, run }),
         jsx(RatePill, { video: state?.video, run }),
       ],
     })
@@ -931,6 +1107,17 @@ function StatusChip() {
   })
 }
 
+function quickCommand(command, data) {
+  haptic('tap')
+  sendCommand(command, data)
+    .catch(() => {})
+    .then(() => {
+      try {
+        globalQueryClient?.invalidateQueries({ queryKey: ['ytm', 'state'] })
+      } catch (e) {}
+    })
+}
+
 export default {
   id: 'ytm-control',
   name: 'YouTube Music Control',
@@ -950,6 +1137,56 @@ export default {
         area: 'statusBar.right',
         order: 131,
         render: () => jsx(StatusChip, {}),
+      },
+      {
+        id: 'cmd-play-pause',
+        area: PALETTE_AREA,
+        data: {
+          id: 'ytm.playPause',
+          label: 'YouTube Music: Play / Pause',
+          keywords: ['ytm', 'youtube', 'music', 'play', 'pause'],
+          run: () => quickCommand('playPause'),
+        },
+      },
+      {
+        id: 'cmd-next',
+        area: PALETTE_AREA,
+        data: {
+          id: 'ytm.next',
+          label: 'YouTube Music: Next Track',
+          keywords: ['ytm', 'youtube', 'music', 'next', 'skip'],
+          run: () => quickCommand('next'),
+        },
+      },
+      {
+        id: 'cmd-prev',
+        area: PALETTE_AREA,
+        data: {
+          id: 'ytm.previous',
+          label: 'YouTube Music: Previous Track',
+          keywords: ['ytm', 'youtube', 'music', 'previous', 'back'],
+          run: () => quickCommand('previous'),
+        },
+      },
+      {
+        id: 'cmd-like',
+        area: PALETTE_AREA,
+        data: {
+          id: 'ytm.toggleLike',
+          label: 'YouTube Music: Like Current Track',
+          keywords: ['ytm', 'youtube', 'music', 'like', 'thumbs up'],
+          run: () => quickCommand('toggleLike'),
+        },
+      },
+      {
+        id: 'cmd-shuffle',
+        area: PALETTE_AREA,
+        data: {
+          id: 'ytm.shuffle',
+          label: 'YouTube Music: Shuffle Queue',
+          keywords: ['ytm', 'youtube', 'music', 'shuffle', 'random'],
+          run: () => quickCommand('shuffle'),
+        },
       },
     ])
   },
