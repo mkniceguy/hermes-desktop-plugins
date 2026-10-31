@@ -14,9 +14,9 @@ ALL_PLUGINS=("ytm-control" "plex-status")
 
 # Resolve default Hermes root ($HERMES_HOME -> %LOCALAPPDATA%/hermes on Windows -> ~/.hermes)
 if [ -n "${HERMES_HOME:-}" ]; then
-  BASE_HOME="$HERMES_HOME"
+  BASE_HOME="${HERMES_HOME//\\//}"
 elif [ -n "${LOCALAPPDATA:-}" ] && [ -d "${LOCALAPPDATA}/hermes" ]; then
-  BASE_HOME="${LOCALAPPDATA}/hermes"
+  BASE_HOME="${LOCALAPPDATA//\\//}/hermes"
 else
   BASE_HOME="$HOME/.hermes"
 fi

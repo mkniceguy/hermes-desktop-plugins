@@ -12,13 +12,14 @@ set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
 if [ -n "${HERMES_HOME:-}" ]; then
-  TARGET_HOME="$HERMES_HOME"
+  TARGET_HOME="${HERMES_HOME//\\//}"
 elif [ -n "${LOCALAPPDATA:-}" ] && [ -d "${LOCALAPPDATA}/hermes" ]; then
-  TARGET_HOME="${LOCALAPPDATA}/hermes"
+  TARGET_HOME="${LOCALAPPDATA//\\//}/hermes"
 else
   TARGET_HOME="$HOME/.hermes"
 fi
 ROOT_HOME="${HERMES_ROOT:-${TARGET_HOME%/profiles/*}}"
+ROOT_HOME="${ROOT_HOME//\\//}"
 DEST="$TARGET_HOME/plugins/ytm-control"
 DESKTOP_DEST="$ROOT_HOME/desktop-plugins/ytm-control"
 
