@@ -1,0 +1,18 @@
+# Dependency declaration for the plex-status Hermes plugin.
+#
+# THIS FILE IS LOAD-BEARING. It is what makes the plugin's Python dependencies
+# survive Hermes updates.
+#
+# Hermes' package manager reads a plugin's dependency declaration from
+# plugin.yaml / plugin.yml (`pip_dependencies`), plugin.json, or this
+# pyproject.toml (`[project].dependencies`). It does NOT read requirements.txt.
+#
+# There is deliberately NO [build-system] table: that marks this as a
+# metadata-only workspace member.
+[project]
+name = "plex-status"
+version = "0.3.0"
+description = "Plex activity pane and statusbar chip backed by Tautulli."
+dependencies = [
+    "httpx>=0.27",
+]

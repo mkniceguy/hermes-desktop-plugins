@@ -4,6 +4,10 @@ Hermes Desktop plugins for [Hermes Agent](https://hermes-agent.nousresearch.com/
 
 ## Plugins
 
+### plex-status (v0.3.0)
+
+Plex activity pane and statusbar mini-chip backed by [Tautulli](https://tautulli.com/): active streams with per-session progress bars, client/device info, LAN/WAN bandwidth breakdown, hardware/software **transcode detection** (video/audio/subtitle legs), collapsible **recently added** strip with media-type badges (`MOVIE`/`TV`/`MUSIC`) and `SxxExx` codes, and `Ctrl+K` Command Palette actions. Uses the unified Python backend (`dashboard/plugin_api.py`) so the Tautulli API key is stored on disk (`chmod 0600`), never sent to the renderer, and protected by a cleartext private-LAN/HTTPS guard. See [`plex-status/README.md`](plex-status/README.md).
+
 ### ytm-control (v0.5.0)
 
 Controls the [YouTube Music Desktop App](https://ytmdesktop.app/) (v2.1.0+) through its
@@ -57,21 +61,29 @@ workspace member (nothing is built from it).
 
 ## Installation
 
-Copy the **whole folder** — the halves are one installable unit:
+Use the top-level `install.sh` (or each plugin's own `install.sh`) — it auto-detects `$HERMES_HOME` (including `%LOCALAPPDATA%\hermes` on Windows) and supports installing into a named profile (`-p <profile>`):
+
+```bash
+./install.sh                           # install all plugins into default Hermes home
+./install.sh -p jarvis                 # install all plugins into profile 'jarvis'
+./install.sh -p jarvis plex-status     # install only plex-status into profile 'jarvis'
+```
+
+Or copy a plugin folder manually — the halves are one installable unit:
 
 ```bash
 ./ytm-control/install.sh
-# or
-cp -R ytm-control ~/.hermes/plugins/ytm-control
+./plex-status/install.sh
 ```
 
-Then enable the backend in `config.yaml` (it is gated on this allow-list, which is a
+Then enable the backend(s) in `config.yaml` (it is gated on this allow-list, which is a
 deliberate security boundary — desktop-side enablement alone does not import Python):
 
 ```yaml
 plugins:
   enabled:
     - ytm-control
+    - plex-status
 ```
 
 Restart Hermes. On startup Hermes installs the declared dependencies and copies

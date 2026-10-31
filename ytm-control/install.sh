@@ -11,17 +11,29 @@
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-DEST="$HERMES_HOME/plugins/ytm-control"
+if [ -n "${HERMES_HOME:-}" ]; then
+  TARGET_HOME="$HERMES_HOME"
+elif [ -n "${LOCALAPPDATA:-}" ] && [ -d "${LOCALAPPDATA}/hermes" ]; then
+  TARGET_HOME="${LOCALAPPDATA}/hermes"
+else
+  TARGET_HOME="$HOME/.hermes"
+fi
+ROOT_HOME="${HERMES_ROOT:-${TARGET_HOME%/profiles/*}}"
+DEST="$TARGET_HOME/plugins/ytm-control"
+DESKTOP_DEST="$ROOT_HOME/desktop-plugins/ytm-control"
 
 echo "Installing ytm-control into:"
-echo "  $DEST"
+echo "  Backend : $DEST"
+echo "  Desktop : $DESKTOP_DEST"
 echo
 
 mkdir -p "$(dirname "$DEST")"
 rm -rf "$DEST"
 cp -R "$SRC" "$DEST"
 rm -f "$DEST/install.sh"
+
+mkdir -p "$DESKTOP_DEST"
+cp "$SRC/desktop/plugin.js" "$DESKTOP_DEST/plugin.js"
 
 echo "Done."
 echo

@@ -1,0 +1,13 @@
+name: plex-status
+version: "0.3.0"
+description: >-
+  Plex activity pane and statusbar chip backed by Tautulli: active streams with
+  per-session progress bars, client/device info, LAN/WAN bandwidth breakdown,
+  hardware/software transcode badges (video/audio/subtitle legs), recently
+  added strip, and Ctrl+K command-palette actions. The Python backend
+  (dashboard/plugin_api.py) is the single source of truth — it owns the
+  Tautulli URL and API key on disk (mode 0600) and proxies all requests.
+author: Dave Knepper
+requires_env: []
+provides_tools: []
+provides_hooks: []
